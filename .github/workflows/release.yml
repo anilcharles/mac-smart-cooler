@@ -1,0 +1,79 @@
+# Releases are driven by release-please (https://github.com/googleapis/release-please),
+# the same way as Mac Cleaner.
+#
+# 1. Every merge to main: release-please reads the new PR titles. If any is a `feat:` or `fix:`,
+#    it opens or updates a "chore: release x.y.z" PR that bumps Cargo.toml / Cargo.lock and
+#    lists the entries as release notes in its description. `docs:`, `ci:`, `chore:` and the
+#    like are left out. There is no CHANGELOG.md; the GitHub Releases are the changelog.
+# 2. Merging that release PR: release-please tags vx.y.z and creates the GitHub Release with the
+#    same notes. Then this Mac (self-hosted runner) tests, builds the DMG with
+#    scripts/make-dmg.sh and attaches it to the release.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # tags, releases, the version-bump commit, DMG upload
+  pull-requests: write # the release PR
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    # Only bookkeeping through the GitHub API, so it runs on GitHub's machines and keeps the
+    # release PR up to date even while this Mac is off.
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+      version: ${{ steps.rp.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: rp
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: [self-hosted, macOS, ARM64]
+    env:
+      TAG: ${{ needs.release-please.outputs.tag_name }}
+      VERSION: ${{ needs.release-please.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Tests
+        run: cargo test --locked
+
+      # Signs with the Developer ID / Apple Development identity in this Mac's keychain (or
+      # ad-hoc if there is none) and builds in the team ID the helper's install step checks.
+      - name: Build app and DMG
+        run: ./scripts/make-dmg.sh
+
+      - name: Check app version
+        run: |
+          APP_VERSION=$(defaults read "$PWD/dist/Mac Smart Cooler.app/Contents/Info.plist" CFBundleShortVersionString)
+          if [ "$APP_VERSION" != "$VERSION" ]; then
+            echo "::error::App says $APP_VERSION but the release is $VERSION"
+            exit 1
+          fi
+
+      - name: Name and checksum the DMG
+        run: |
+          DMG="Mac-Smart-Cooler-$VERSION-arm64.dmg"
+          mv dist/MacSmartCooler.dmg "$DMG"
+          shasum -a 256 "$DMG" > "$DMG.sha256"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+
+      - name: Attach DMG to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" "$DMG" "$DMG.sha256" --clobber
