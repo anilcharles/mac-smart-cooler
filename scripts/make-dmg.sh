@@ -12,7 +12,34 @@ TEAM=""
 if [ -n "$SIGN_ID" ]; then
   TEAM=$(security find-certificate -c "$SIGN_ID" -p 2>/dev/null | openssl x509 -noout -subject -nameopt multiline 2>/dev/null | awk -F' = ' '/organizationalUnitName/{print $2; exit}')
 fi
-[ -n "$TEAM" ] && echo "Team ID: $TEAM" || echo "warning: no signing team; install step can't verify the app's signature"
+if [ -n "$TEAM" ]; then
+  echo "Team ID: $TEAM"
+elif [ -n "${CI:-}" ]; then
+  # A release without a team would skip the helper install's signature check entirely.
+  echo "error: no signing team found; refusing to build a release that can't verify itself" >&2
+  exit 1
+else
+  echo "warning: no signing team; install step can't verify the app's signature"
+fi
+
+# Check that the signing key is usable before the long build. Seeing the identity is not
+# enough: a process in a different security session (e.g. a GitHub runner LaunchAgent with
+# SessionCreate) sees the certificate, but codesign can't use the locked private key and
+# fails with errSecInternalComponent.
+if [ -n "$SIGN_ID" ]; then
+  probe=$(mktemp -d)
+  cp /usr/bin/true "$probe/probe"
+  if ! codesign --force --sign "$SIGN_ID" "$probe/probe" 2>"$probe/err"; then
+    cat "$probe/err" >&2
+    echo "error: can't sign with \"$SIGN_ID\": its private key isn't usable from this process." >&2
+    echo "  Unlock the login keychain. On a self-hosted runner, don't let launchd start it in a" >&2
+    echo "  new security session (SessionCreate); see \"Release runner\" in README.md." >&2
+    rm -rf "$probe"
+    exit 1
+  fi
+  rm -rf "$probe"
+fi
+
 MACSMARTCOOLER_TEAM_ID="$TEAM" cargo build --release
 
 rm -rf dist

@@ -306,6 +306,23 @@ window with `sudo`. See *Known open items* above.
 The tests replay situations measured on a real M1 Pro (app launches, noisy sensors, a game
 launcher, hours of Blender) and check that Smart Cooling stays quiet or cools as expected.
 
+### Release runner
+
+Releases are built on a self-hosted macOS runner. It signs with the identity in the login
+keychain of the account it runs as. When installed with `./svc.sh install`, the runner's
+LaunchAgent has `SessionCreate` set to true. launchd then starts the runner in a new security
+session where the login keychain is locked, so `codesign` fails with `errSecInternalComponent`.
+Turn it off once (and again after any `svc.sh install`):
+
+```sh
+P=~/Library/LaunchAgents/actions.runner.<owner>-mac-smart-cooler.<host>.plist
+plutil -replace SessionCreate -bool false "$P"
+launchctl bootout gui/$(id -u) "$P"; launchctl bootstrap gui/$(id -u) "$P"
+```
+
+The runner then signs only while you're logged in with the login keychain unlocked.
+`make-dmg.sh` checks this before building, and in CI it refuses to build without a signing team.
+
 ## Source layout
 
 | File | Role |
