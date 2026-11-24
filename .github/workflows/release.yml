@@ -55,7 +55,7 @@ jobs:
 
       # Signs with the Developer ID / Apple Development identity in this Mac's login keychain and
       # builds in the team ID the helper's install step checks. In CI it fails if there is no
-      # team or the key can't be used (runner started with SessionCreate: see README.md, "Release
+      # team or the key can't be used (runner started with SessionCreate: see docs/development.md, "Release
       # runner").
       - name: Build app and DMG
         run: ./scripts/make-dmg.sh

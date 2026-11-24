@@ -33,7 +33,7 @@ if [ -n "$SIGN_ID" ]; then
     cat "$probe/err" >&2
     echo "error: can't sign with \"$SIGN_ID\": its private key isn't usable from this process." >&2
     echo "  Unlock the login keychain. On a self-hosted runner, don't let launchd start it in a" >&2
-    echo "  new security session (SessionCreate); see \"Release runner\" in README.md." >&2
+    echo "  new security session (SessionCreate); see \"Release runner\" in docs/development.md." >&2
     rm -rf "$probe"
     exit 1
   fi
