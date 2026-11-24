@@ -223,8 +223,8 @@ launcher, hours of Blender) and check that Smart Cooling stays quiet or cools as
 | `src/auth.rs` | macOS admin password prompt |
 | `src/settings.rs` | Saved preset and preferences |
 | `src/state.rs` | App-wide state: the worker, the menu bar item, settings, fan history |
-| `src/ui.rs` | The window (GPUI): sidebar, fans, sensors, dialogs |
-| `src/widgets.rs`, `src/theme.rs` | Building blocks and colours, shared with Mac Cleaner |
+| `src/ui.rs` | The window (GPUI): status card, modes, fans, sensors, dialogs |
+| `src/widgets.rs`, `src/theme.rs` | Building blocks and colours (light/dark, zoom) |
 | `src/charts.rs`, `src/elided.rs` | Ring gauge, rpm history, one-line text with "…" |
 | `src/ui_prefs.rs` | Appearance and zoom (window only, not shared with the helper) |
 | `src/tray.rs` | Menu bar icon and menu |

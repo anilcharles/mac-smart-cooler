@@ -1,9 +1,9 @@
-//! Colours and metrics. The palette and `pt()` are Mac Cleaner's, so both apps look alike;
-//! the temperature scale and fan-gauge colours are this app's own.
+//! Colours and metrics. Dark is the original (egui) Mac Smart Cooler palette; light is its
+//! counterpart on Mac Cleaner's light colours. `pt()` and the zoom steps are Mac Cleaner's.
 
 use gpui::{rgb, rgba, Hsla, Rems, WindowAppearance};
 
-/// Mac Cleaner's palette, kept whole (a few colours are unused here).
+/// A few colours are unused here; kept so the palette matches Mac Cleaner's names.
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct Theme {
@@ -40,6 +40,12 @@ pub struct Theme {
     pub t_red: Hsla,
     /// Second colour of the fan gauge (the first is `accent`).
     pub cyan: Hsla,
+    /// Bottom of the window's vertical background gradient (`bg` is the top).
+    pub bg_bottom: Hsla,
+    /// The sunken track behind segmented controls.
+    pub well: Hsla,
+    /// The selected segment of a segmented control.
+    pub seg_on: Hsla,
     /// Light theme or not, for the few colours mixed by hand.
     pub dark: bool,
 }
@@ -78,48 +84,55 @@ impl Theme {
             warning_soft: rgba(0xff9f0a1f).into(),
             folder: rgb(0x3a9cf5).into(),
             shadow: rgba(0x0000001a).into(),
-            backdrop: rgba(0x00000047).into(),
+            backdrop: rgba(0x00000000).into(),
             t_cool: rgb(0x1aa57d).into(),
             t_warm: rgb(0xd99a00).into(),
             t_hot: rgb(0xf06a1c).into(),
             t_red: rgb(0xff3b30).into(),
             cyan: rgb(0x32ade6).into(),
+            bg_bottom: rgb(0xebebef).into(),
+            well: rgb(0xe8e8ed).into(),
+            seg_on: rgb(0xffffff).into(),
             dark: false,
         }
     }
 
+    /// The original Mac Smart Cooler colours.
     pub fn dark() -> Self {
         Self {
             scale: 1.,
-            bg: rgb(0x1c1c1e).into(),
-            sidebar: rgb(0x232325).into(),
-            surface: rgb(0x2a2a2d).into(),
-            surface_2: rgb(0x303033).into(),
-            hover: rgba(0xffffff0a).into(),
+            bg: rgb(0x131419).into(),
+            sidebar: rgb(0x131419).into(),
+            surface: rgb(0x191b21).into(),
+            surface_2: rgb(0x22252c).into(),
+            hover: rgba(0xffffff0f).into(),
             selected_row: rgba(0x0a84ff1a).into(),
-            border: rgba(0xffffff14).into(),
-            border_strong: rgba(0xffffff29).into(),
-            text: rgb(0xf5f5f7).into(),
-            text_2: rgb(0xa1a1a6).into(),
-            text_3: rgb(0x7c7c80).into(),
+            border: rgba(0xffffff10).into(),
+            border_strong: rgba(0xffffff1c).into(),
+            text: rgb(0xf2f3f6).into(),
+            text_2: rgb(0x989da8).into(),
+            text_3: rgb(0x626772).into(),
             accent: rgb(0x0a84ff).into(),
-            accent_hover: rgb(0x3395ff).into(),
-            accent_soft: rgba(0x0a84ff2e).into(),
+            accent_hover: rgb(0x2f95ff).into(),
+            accent_soft: rgba(0x0a84ff29).into(),
             danger: rgb(0xff453a).into(),
             danger_hover: rgb(0xff5e55).into(),
-            danger_soft: rgba(0xff453a29).into(),
+            danger_soft: rgba(0xff453a1a).into(),
             success: rgb(0x30d158).into(),
-            success_soft: rgba(0x30d15826).into(),
-            warning: rgb(0xffa526).into(),
-            warning_soft: rgba(0xffa52626).into(),
+            success_soft: rgba(0x30d1581c).into(),
+            warning: rgb(0xffc440).into(),
+            warning_soft: rgba(0xffc4401c).into(),
             folder: rgb(0x4aa8ff).into(),
-            shadow: rgba(0x00000066).into(),
-            backdrop: rgba(0x00000073).into(),
+            shadow: rgba(0x0000008c).into(),
+            backdrop: rgba(0x00000000).into(),
             t_cool: rgb(0x30d1a0).into(),
             t_warm: rgb(0xffc440).into(),
             t_hot: rgb(0xff8040).into(),
             t_red: rgb(0xff453a).into(),
             cyan: rgb(0x64d2ff).into(),
+            bg_bottom: rgb(0x0b0c0f).into(),
+            well: rgb(0x111216).into(),
+            seg_on: rgb(0x22252c).into(),
             dark: true,
         }
     }
@@ -150,25 +163,12 @@ pub fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
     gpui::Rgba { r: l(a.r, b.r), g: l(a.g, b.g), b: l(a.b, b.b), a: l(a.a, b.a) }.into()
 }
 
-/// Gradient colours of the mode tiles (top, bottom).
-pub fn tile_colors(id: &str) -> (u32, u32) {
-    match id {
-        "auto" => (0xa7a7b0, 0x74747c),
-        "smart" => (0x64d8cb, 0x2ba9bf),
-        "full" => (0xffbb4d, 0xff8c00),
-        "custom" => (0xd98af5, 0xa64bd6),
-        "fan" => (0x6fb1ff, 0x3a6fe0),
-        "settings" => (0x9fabbd, 0x5f6d82),
-        _ => (0x5ac8fa, 0x007aff),
-    }
-}
-
 /// Zoom levels offered by View > Zoom In / Zoom Out.
 pub const ZOOM_STEPS: [f32; 5] = [0.85, 1.0, 1.15, 1.3, 1.5];
 
 /// Window size at 100% zoom, in points: (default, minimum).
-pub const WINDOW_SIZE: (f32, f32) = (1120., 740.);
-pub const WINDOW_MIN: (f32, f32) = (940., 640.);
+pub const WINDOW_SIZE: (f32, f32) = (1140., 640.);
+pub const WINDOW_MIN: (f32, f32) = (1000., 600.);
 
 /// A size in design points (what it measures at 100% zoom).
 ///
@@ -178,5 +178,8 @@ pub const fn pt(points: f32) -> Rems {
     Rems(points / 16.)
 }
 
-pub const TITLEBAR: Rems = pt(52.);
-pub const SIDEBAR_W: Rems = pt(324.);
+/// The original layout's metrics.
+pub const TITLEBAR: Rems = pt(38.);
+pub const SENSORS_W: Rems = pt(320.);
+pub const GAP: Rems = pt(14.);
+pub const CARD_RADIUS: Rems = pt(16.);

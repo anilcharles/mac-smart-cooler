@@ -14,7 +14,7 @@ use crate::ui_prefs::{ThemeMode, UiPrefs};
 use crate::widgets::*;
 use crate::worker::{FanMode, Snapshot};
 use gpui::{
-    actions, canvas, div, point, prelude::*, relative, App, Bounds, ClickEvent, Context, Div, Entity,
+    actions, canvas, div, linear_color_stop, linear_gradient, point, prelude::*, relative, App, Bounds, ClickEvent, Context, Div, Entity,
     FocusHandle, FontWeight, Global, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Point, SharedString, Size, Stateful, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
     WindowHandle, WindowOptions,
@@ -64,7 +64,6 @@ enum Modal {
 /// Something a popup menu entry does.
 #[derive(Clone)]
 enum Cmd {
-    Theme(ThemeMode),
     Sensor(String),
 }
 
@@ -383,7 +382,6 @@ impl Main {
 
     fn run_cmd(&mut self, cmd: Cmd, cx: &mut Context<Self>) {
         match cmd {
-            Cmd::Theme(mode) => self.set_theme(mode, cx),
             Cmd::Sensor(key) => {
                 if let Some(d) = &mut self.dialog {
                     d.sensor = key;
@@ -464,229 +462,87 @@ impl Main {
     }
 
     /* ================================================================
-       Sidebar
+       Title bar (transparent; the traffic lights sit on the left)
        ================================================================ */
 
-    fn sidebar(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
-        let status = self.status_card(v, t, cx);
-        let rows: Vec<_> = Preset::ALL.iter().enumerate().map(|(i, &p)| {
-            let active = v.preset == p;
-            let (tile_id, icon_name) = p.tile();
-            div()
-                .id(("mode", i))
-                .min_h(pt(52.))
-                .px(pt(12.))
-                .rounded(pt(10.))
-                .flex()
-                .items_center()
-                .gap(pt(12.))
-                .cursor_pointer()
-                .when(active, |el| el.bg(t.surface).shadow(small_shadow(t)))
-                .when(!active, |el| el.hover(|s| s.bg(t.hover)))
-                .on_click(cx.listener(move |this, _, _, cx| this.choose(p, cx)))
-                .child(tile(tile_id, icon_name, 30.))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(div().ellipsis().font_weight(FontWeight::SEMIBOLD).child(elided(p.title())))
-                        .child(div().ellipsis().text_size(pt(11.5)).text_color(t.text_3).child(elided(p.subtitle()))),
-                )
-                .child(if active {
-                    div().child(icon("check-bold", 12., t.accent))
-                } else {
-                    div().text_size(pt(11.5)).text_color(t.text_3).child(format!("⌘{}", i + 1))
-                })
-        }).collect();
-        let custom = (v.preset == Preset::Custom).then(|| {
-            let (tile_id, icon_name) = Preset::Custom.tile();
-            div()
-                .min_h(pt(52.))
-                .px(pt(12.))
-                .rounded(pt(10.))
-                .flex()
-                .items_center()
-                .gap(pt(12.))
-                .bg(t.surface)
-                .shadow(small_shadow(t))
-                .child(tile(tile_id, icon_name, 30.))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(div().ellipsis().font_weight(FontWeight::SEMIBOLD).child(elided("Custom")))
-                        .child(div().ellipsis().text_size(pt(11.5)).text_color(t.text_3).child(elided("Each fan has its own setting"))),
-                )
-        });
-
+    fn titlebar(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
+        let prefs_open = self.modal == Modal::Prefs;
         div()
-            .w(SIDEBAR_W)
+            .h(TITLEBAR)
             .flex_none()
-            .h_full()
+            // the traffic lights are drawn by macOS at a fixed size, so their space is real pixels
+            .pl(gpui::px(86.))
+            .pr(pt(14.))
+            .pt(pt(1.))
             .flex()
-            .flex_col()
-            .pt(TITLEBAR)
-            .px(pt(12.))
-            .pb(pt(12.))
-            .bg(t.sidebar)
-            .border_r_1()
-            .border_color(t.border)
-            .child(div().id("sidebar-scroll").flex_1().min_h_0().overflow_y_scroll().child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(status)
-                    .child(section("MODES", t).mx(pt(16.)).mb(pt(6.)))
-                    .child(div().flex().flex_col().gap(pt(2.)).children(rows).children(custom)),
-            ))
+            .items_center()
+            .gap(pt(8.))
+            .child(div().text_size(pt(14.)).child("Mac Smart Cooler"))
             .child(
                 div()
-                    .id("machine")
-                    .mt(pt(10.))
-                    .mx(pt(4.))
-                    .px(pt(12.))
-                    .pt(pt(12.))
-                    .border_t_1()
+                    .id("model")
+                    .text_size(pt(12.))
+                    .text_color(t.text_3)
+                    .tooltip(tip(format!("Model identifier: {}", v.model_id), t))
+                    .child(v.model.clone()),
+            )
+            .child(div().flex_1())
+            .child(self.control_status(v, t, cx))
+            .child(
+                div()
+                    .id("prefs")
+                    .size(pt(28.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(if prefs_open { t.hover } else { t.surface_2 })
+                    .border_1()
                     .border_color(t.border)
                     .flex()
                     .items_center()
-                    .gap(pt(12.))
-                    .tooltip(tip(format!("Model identifier: {}", v.model_id), t))
-                    .child(icon("laptop", 18., t.text_2))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(div().ellipsis().text_size(pt(12.)).font_weight(FontWeight::SEMIBOLD).child(elided(v.model.clone())))
-                            .child(div().text_size(pt(11.5)).text_color(t.text_3).child(v.model_id.clone())),
-                    ),
-            )
-    }
-
-    /// Hottest-core gauge and whether fan control is on.
-    fn status_card(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
-        let a = &v.snap.activity;
-        let hot = v.hot();
-        let trend = if v.s.fahrenheit { a.trend * 1.8 } else { a.trend };
-        let arrow = if a.trend > 0.5 {
-            "arrow-up"
-        } else if a.trend < -0.5 {
-            "arrow-down"
-        } else {
-            "arrow-right"
-        };
-        let fans = if !v.snap.ready {
-            "Reading fans…".to_string()
-        } else if v.snap.fans.is_empty() {
-            "No fans".into()
-        } else if v.snap.fans.iter().all(|f| f.actual < 1.) {
-            "Fans off".into()
-        } else {
-            format!("{} rpm", v.snap.fans.iter().map(|f| thousands(f.actual)).collect::<Vec<_>>().join(" · "))
-        };
-
-        let gauge = div()
-            .relative()
-            .size(pt(104.))
-            .flex_none()
-            .child(div().absolute().inset_0().child(ring_gauge(hot, *t)))
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .flex_col()
-                    .items_center()
                     .justify_center()
-                    .child(
-                        div()
-                            .text_size(pt(28.))
-                            .font_weight(FontWeight::BOLD)
-                            .line_height(pt(32.))
-                            .text_color(if hot.is_some() { t.text } else { t.text_3 })
-                            .child(hot.map(|h| v.deg(h)).unwrap_or_else(|| "—".into())),
-                    )
-                    .child(div().text_size(pt(10.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_3).child("HOTTEST")),
-            );
-
-        let info = div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap(pt(3.))
-            .child(div().text_size(pt(12.)).font_weight(FontWeight::MEDIUM).text_color(t.text_2).child("Hottest core"))
-            .when(hot.is_some(), |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(pt(4.))
-                        .text_size(pt(12.))
-                        .text_color(t.text_2)
-                        .child(icon(arrow, 12., t.text_2))
-                        .child(format!("{trend:+.1}°/min")),
-                )
-            })
-            .child(div().ellipsis().text_size(pt(12.)).text_color(t.text_3).child(elided(fans)));
-
-        card(t)
-            .mx(pt(4.))
-            .mb(pt(16.))
-            .p(pt(16.))
-            .child(div().flex().items_center().gap(pt(14.)).child(gauge).child(info))
-            .child(div().mt(pt(14.)).pt(pt(12.)).border_t_1().border_color(t.border).child(self.control_status(v, t, cx)))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.hover))
+                    .tooltip(tip("Preferences", t))
+                    .child(icon("gear", 15., t.text_2))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let open = this.modal == Modal::Prefs;
+                        this.close_modal(cx);
+                        if !open {
+                            this.modal = Modal::Prefs;
+                        }
+                    })),
+            )
     }
 
     /// Fan control on, or the one button that gets it there.
     fn control_status(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
         let root = v.snap.root;
         let install = |id: &'static str, label: &'static str, hint: &'static str, cx: &mut Context<Self>| {
-            button(id, label, Some("shield"), Btn::Primary, true, t)
-                .w_full()
-                .mt(pt(10.))
+            button(id, label, None, Btn::Primary, true, t)
                 .tooltip(tip(hint, t))
                 .on_click(cx.listener(|this, _, _, cx| this.ctl.read(cx).request_install()))
         };
-        let note = |text: &'static str| div().mt(pt(8.)).text_size(pt(12.)).line_height(pt(17.)).text_color(t.text_3).child(text);
-        let el = div().flex().flex_col();
+        let el = div().flex().items_center().gap(pt(8.));
         if v.installing {
-            el.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(pt(8.))
-                    .child(spinner("installing", 14., t))
-                    .child(div().text_color(t.text_2).child("Waiting for your password…")),
-            )
+            el.child(status_pill("Waiting for password…", t.warning))
         } else if v.helper == helper::Status::Outdated && !root {
-            el.child(div().flex().child(status_pill("Helper out of date", t.warning, t.warning_soft))).child(install(
+            el.child(install(
                 "update-helper",
                 "Update helper",
                 "The background helper is older than this app. One password prompt updates it.",
                 cx,
             ))
         } else if v.helper == helper::Status::Unreachable && !root {
-            el.child(div().flex().child(status_pill("Helper not answering", t.warning, t.warning_soft))).child(install(
+            el.child(install(
                 "repair-helper",
                 "Repair helper",
                 "The background helper isn't answering. One password prompt reinstalls it.",
                 cx,
             ))
         } else if v.snap.can_control {
-            el.child(div().flex().child(status_pill("Fan control on", t.success, t.success_soft)))
-                .child(note("Your mode keeps running after you quit, and after restarts."))
+            el.child(status_pill("Fan control on", t.success))
         } else {
-            el.child(div().flex().child(status_pill(
-                if v.snap.ready { "Monitoring only" } else { "Starting…" },
-                t.warning,
-                t.warning_soft,
-            )))
-            .child(install(
+            el.child(status_pill(if v.snap.ready { "Monitoring only" } else { "Starting…" }, t.warning)).child(install(
                 "enable",
                 "Enable fan control",
                 "Installs a small background helper. Asks for your password once, never again.",
@@ -699,46 +555,56 @@ impl Main {
        Main column
        ================================================================ */
 
-    fn main_column(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
-        div().flex_1().min_w_0().h_full().child(
-            div().id("main-scroll").size_full().overflow_y_scroll().child(
+    /// Big status card: hottest-core ring gauge, what the current mode is doing, live load.
+    fn hero(&self, v: &V, t: &Theme) -> Div {
+        let a = &v.snap.activity;
+        let hot = v.hot();
+        let arrow = if a.trend > 0.5 {
+            "↑"
+        } else if a.trend < -0.5 {
+            "↓"
+        } else {
+            "→"
+        };
+        let trend = if v.s.fahrenheit { a.trend * 1.8 } else { a.trend };
+        let gauge = div()
+            .relative()
+            .size(pt(148.))
+            .flex_none()
+            .child(div().absolute().inset_0().child(ring_gauge(hot, *t)))
+            .child(
                 div()
+                    .absolute()
+                    .inset_0()
                     .flex()
                     .flex_col()
-                    .gap(pt(20.))
-                    .px(pt(28.))
-                    .pt(pt(56.))
-                    .pb(pt(28.))
-                    .child(self.header(v, t))
-                    .child(self.meters(v, t))
-                    .when_some(v.snap.error.clone(), |el, e| {
-                        el.child(
-                            div()
-                                .flex()
-                                .items_start()
-                                .gap(pt(10.))
-                                .px(pt(14.))
-                                .py(pt(10.))
-                                .rounded(pt(10.))
-                                .bg(t.danger_soft)
-                                .child(div().mt(pt(1.)).child(icon("alert", 16., t.danger)))
-                                .child(div().flex_1().min_w_0().line_height(pt(19.)).child(e)),
-                        )
+                    .items_center()
+                    .justify_center()
+                    .when_some(hot, |el, h| {
+                        el.child(num(40.).line_height(pt(46.)).child(v.deg(h)))
+                            .child(num(12.).text_color(t.text_2).child(format!("{arrow} {trend:+.1}°/min")))
                     })
-                    .child(self.fans(v, t, cx))
-                    .child(self.sensors(v, t)),
-            ),
-        )
-    }
+                    .when(hot.is_none(), |el| el.child(num(36.).text_color(t.text_3).child("—"))),
+            )
+            .when(hot.is_some(), |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom(pt(6.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .text_size(pt(10.))
+                        .text_color(t.text_3)
+                        .child("HOTTEST CORE"),
+                )
+            });
 
-    /// The current mode, like Mac Cleaner's category header.
-    fn header(&self, v: &V, t: &Theme) -> Div {
-        let a = &v.snap.activity;
-        let (tile_id, icon_name) = v.preset.tile();
-        let (custom_fg, custom_bg) = (gpui::rgb(0xa64bd6).into(), gpui::rgba(0xa64bd626).into());
-        let (badge_el, detail): (Div, String) = match v.preset {
+        let (label, title, detail): (&str, String, String) = match v.preset {
             Preset::Automatic => (
-                badge("macOS in control", t.text_2, t.border),
+                "APPLE DEFAULT",
+                "macOS is in control".into(),
                 "Fans follow Apple's own curve and often stay off until the chip is already hot.".into(),
             ),
             Preset::Smart => {
@@ -748,40 +614,12 @@ impl Main {
                 if let Some(f) = d.get(0..1) {
                     d = f.to_uppercase() + &d[1..];
                 }
-                let b = if state.starts_with("Cooling") {
-                    badge(state.to_string(), t.accent, t.accent_soft)
-                } else {
-                    badge(state.to_string(), t.success, t.success_soft)
-                };
-                (b, format!("{d}."))
+                ("SMART COOLING", state.to_string(), d)
             }
-            Preset::FullBlast => (badge("Maximum airflow", t.warning, t.warning_soft), "Every fan is running at full speed.".into()),
-            Preset::Custom => (badge("Per-fan settings", custom_fg, custom_bg), "Each fan follows its own setting below.".into()),
+            Preset::FullBlast => ("FULL BLAST", "Maximum airflow".into(), "Every fan is running at full speed.".into()),
+            Preset::Custom => ("CUSTOM", "Per-fan settings".into(), "Each fan follows its own setting below.".into()),
         };
-        div()
-            .flex()
-            .items_start()
-            .gap(pt(16.))
-            .child(tile_lg(tile_id, icon_name))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(pt(8.))
-                            .child(div().text_size(pt(20.)).font_weight(FontWeight::BOLD).child(v.preset.title()))
-                            .child(badge_el),
-                    )
-                    .child(div().mt(pt(3.)).text_color(t.text_2).line_height(pt(19.)).child(detail)),
-            )
-    }
 
-    /// Live load and the two case temperatures Smart Cooling watches.
-    fn meters(&self, v: &V, t: &Theme) -> Div {
-        let a = &v.snap.activity;
         let mut items: Vec<(&str, String, f32, Hsla)> = vec![("CPU", format!("{:.0}%", a.cpu * 100.0), a.cpu as f32, t.load(a.cpu))];
         if let Some(g) = a.gpu {
             items.push(("GPU", format!("{:.0}%", g * 100.0), g as f32, t.load(g)));
@@ -792,50 +630,102 @@ impl Main {
         if let Some(b) = a.body {
             items.push(("CASE AIR", v.temp(b), ((b - 28.0) / 36.0) as f32, t.temp(b + 20.0)));
         }
-        let cells = items.into_iter().enumerate().map(|(i, (label, value, frac, col))| {
+        let meters = items.into_iter().map(|(label, value, frac, col)| {
             div()
                 .flex_1()
-                .min_w_0()
-                .px(pt(16.))
-                .py(pt(14.))
-                .when(i > 0, |el| el.border_l_1().border_color(t.border))
-                .child(section(label, t))
-                .child(div().mt(pt(2.)).text_size(pt(18.)).font_weight(FontWeight::BOLD).child(if v.snap.ready { value } else { "—".into() }))
+                .min_w(pt(60.))
+                .child(div().text_size(pt(10.)).text_color(t.text_3).child(label))
+                .child(num(18.).line_height(pt(24.)).child(value))
                 .child(
                     div()
+                        .mt(pt(4.))
                         .h(pt(4.))
-                        .mt(pt(8.))
                         .rounded(pt(2.))
-                        .bg(t.border)
-                        .overflow_hidden()
-                        .child(div().h_full().w(relative(frac.clamp(0.02, 1.))).rounded(pt(2.)).bg(gradient_h(mix(col, t.surface, 0.35), col))),
+                        .bg(t.well)
+                        .child(div().h_full().w(relative(frac.clamp(0.05, 1.))).rounded(pt(2.)).bg(gradient_h(mix(col, t.surface, 0.35), col))),
                 )
         });
-        card(t).flex().children(cells)
+
+        panel(t)
+            .p(pt(22.))
+            .flex()
+            .items_center()
+            .gap(pt(20.))
+            .child(gauge)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(pt(4.))
+                    .child(div().text_size(pt(11.)).text_color(t.cyan).child(label))
+                    .child(div().text_size(pt(26.)).line_height(pt(32.)).child(title))
+                    .child(div().text_color(t.text_2).child(detail))
+                    .child(div().mt(pt(12.)).flex().gap(pt(18.)).children(meters)),
+            )
+    }
+
+    /// The three presets as large cards.
+    fn mode_cards(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
+        let cards = Preset::ALL.into_iter().enumerate().map(|(i, p)| {
+            let sel = v.preset == p;
+            let glyph = ["check-circle", "gauge", "wind"][i];
+            let (fill, hover) = if sel { (mix(t.surface, t.accent, 0.16), mix(t.surface, t.accent, 0.16)) } else { (t.surface, mix(t.surface, t.surface_2, 0.6)) };
+            div()
+                .id(("mode", i))
+                .flex_1()
+                .min_w_0()
+                .h(pt(64.))
+                .px(pt(11.))
+                .rounded(pt(14.))
+                .bg(fill)
+                .border_1()
+                .border_color(if sel { t.accent } else { t.border })
+                .flex()
+                .items_center()
+                .gap(pt(12.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .when(!sel, |el| el.on_click(cx.listener(move |this, _, _, cx| this.choose(p, cx))))
+                .child(
+                    div()
+                        .size(pt(34.))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(if sel { mix(t.surface_2, t.accent, 0.25) } else { t.surface_2 })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon(glyph, 19., if sel { t.cyan } else { t.text_2 })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().ellipsis().text_size(pt(14.)).child(elided(p.title())))
+                        .child(
+                            div()
+                                .ellipsis()
+                                .text_size(pt(11.5))
+                                .text_color(if sel { t.text_2 } else { t.text_3 })
+                                .child(elided(p.subtitle())),
+                        ),
+                )
+        });
+        div().flex().gap(pt(12.)).children(cards)
     }
 
     fn fans(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
-        let head = div().flex().items_center().gap(pt(8.)).child(section("FANS", t));
+        let row = div().flex_1().min_h(pt(150.)).flex().gap(pt(12.));
         if !v.snap.ready || v.snap.fans.is_empty() {
-            let (ic, text) = if v.snap.ready { ("fan", "No fans found (fanless Mac?)") } else { ("", "Reading fans…") };
-            return div().flex().flex_col().gap(pt(8.)).child(head).child(
-                card(t)
-                    .p(pt(16.))
-                    .flex()
-                    .items_center()
-                    .gap(pt(10.))
-                    .text_color(t.text_2)
-                    .child(if ic.is_empty() { spinner("fans-loading", 16., t) } else { div().child(icon(ic, 16., t.text_3)) })
-                    .child(text),
-            );
+            let text = if v.snap.ready { "No fans found (fanless Mac?)" } else { "Reading fans…" };
+            return row.child(panel(t).flex_1().p(pt(18.)).text_color(t.text_2).child(text));
         }
         let cards: Vec<Div> = v.snap.fans.iter().map(|f| self.fan_card(f, v, t, cx)).collect();
-        div()
-            .flex()
-            .flex_col()
-            .gap(pt(8.))
-            .child(head)
-            .child(div().flex().flex_wrap().gap(pt(16.)).children(cards))
+        row.children(cards)
     }
 
     fn fan_card(&self, fan: &FanInfo, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
@@ -855,7 +745,7 @@ impl Main {
         let is_smart = matches!(mode, FanMode::Smart { .. });
         let sel = if is_auto { 0 } else if is_smart { 1 } else { 2 };
         let idx = fan.index;
-        let switcher = segmented(t).children(["Auto", "Smart", "Custom"].into_iter().enumerate().map(|(i, label)| {
+        let switcher = segmented(t).w(pt(186.)).min_w(pt(168.)).flex_shrink().children(["Auto", "Smart", "Custom"].into_iter().enumerate().map(|(i, label)| {
             let f = fan.clone();
             let m = mode.clone();
             segment(("fan-mode", idx * 8 + i), label, sel == i, t).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -876,236 +766,143 @@ impl Main {
         let frac = if fan.max > 0. { (rpm as f64 / fan.max).clamp(0., 1.) as f32 } else { 0. };
         let min_frac = if fan.max > 0. { (fan.min / fan.max).clamp(0., 1.) as f32 } else { 0. };
         let hist = v.hist.get(idx).cloned().unwrap_or_default();
+        let spinning = fan.actual > 0.;
 
-        card(t)
+        panel(t)
             .flex_1()
-            .min_w(pt(300.))
-            .p(pt(16.))
+            .min_w_0()
+            .p(pt(18.))
             .flex()
             .flex_col()
-            .gap(pt(12.))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(pt(12.))
-                    .child(tile(if fan.actual > 0. { "fan" } else { "muted" }, "fan", 30.))
+                    .gap(pt(10.))
+                    .child(
+                        div()
+                            .size(pt(32.))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(t.well)
+                            .border_1()
+                            .border_color(t.border)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon("fan", 22., if spinning { t.cyan } else { t.text_3 })),
+                    )
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(pt(84.))
                             .flex()
                             .flex_col()
-                            .child(div().ellipsis().font_weight(FontWeight::SEMIBOLD).child(elided(fan.name.clone())))
+                            .child(div().ellipsis().text_size(pt(14.)).child(elided(fan.name.clone())))
                             .child(div().ellipsis().text_size(pt(11.5)).text_color(t.text_3).child(elided(status))),
-                    ),
+                    )
+                    .child(switcher),
             )
-            .child(switcher)
             .child(
                 div()
                     .relative()
-                    .h(pt(84.))
+                    .flex_1()
+                    .min_h(pt(24.))
+                    .mt(pt(18.))
+                    .mb(pt(10.))
                     .child(div().absolute().inset_0().child(sparkline(hist, HIST_SECS, fan.max as f32, *t)))
-                    .child(div().absolute().top_0().left_0().child(section("LAST 2 MIN", t).text_size(pt(10.)))),
+                    .child(div().absolute().top_0().left_0().text_size(pt(9.5)).text_color(t.text_3).child("LAST 2 MIN")),
             )
             .child(
                 div()
                     .flex()
                     .items_baseline()
                     .gap(pt(6.))
-                    .child(div().text_size(pt(30.)).font_weight(FontWeight::BOLD).line_height(pt(34.)).child(thousands(rpm as f64)))
+                    .child(num(38.).line_height(pt(42.)).child(thousands(rpm as f64)))
                     .child(div().text_size(pt(13.)).text_color(t.text_3).child("rpm"))
                     .child(div().flex_1())
-                    .when(fan.max > 0., |el| {
-                        el.child(div().text_size(pt(13.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_2).child(format!("{:.0}%", frac * 100.)))
-                    }),
+                    .when(fan.max > 0., |el| el.child(num(13.).text_color(t.text_2).child(format!("{:.0}%", frac * 100.)))),
             )
             .when(fan.max > 0., |el| {
                 el.child(
                     div()
                         .relative()
+                        .mt(pt(8.))
                         .h(pt(6.))
                         .rounded(pt(3.))
-                        .bg(t.border)
-                        .child(div().h_full().w(relative(frac.max(0.01))).rounded(pt(3.)).bg(gradient_h(t.accent, t.cyan)))
-                        .child(div().absolute().top(pt(-3.)).left(relative(min_frac)).w(pt(1.5)).h(pt(12.)).rounded(pt(1.)).bg(t.text_3)),
+                        .bg(t.well)
+                        .child(div().h_full().w(relative(frac.max(0.02))).rounded(pt(3.)).bg(gradient_h(t.accent, t.cyan)))
+                        .child(div().absolute().top(pt(-3.)).left(relative(min_frac)).w(pt(1.5)).h(pt(12.)).rounded(pt(1.)).bg(t.text_2)),
                 )
                 .child(
                     div()
+                        .mt(pt(6.))
                         .flex()
-                        .text_size(pt(11.))
-                        .text_color(t.text_3)
-                        .child(format!("min {}", thousands(fan.min)))
+                        .child(num(11.).text_color(t.text_3).child(format!("min {}", thousands(fan.min))))
                         .child(div().flex_1())
-                        .child(format!("max {}", thousands(fan.max))),
+                        .child(num(11.).text_color(t.text_3).child(format!("max {}", thousands(fan.max)))),
                 )
             })
     }
 
+    /* ================================================================
+       Sensors (right column)
+       ================================================================ */
+
     fn sensors(&self, v: &V, t: &Theme) -> Div {
-        let shown: Vec<&Reading> = v.snap.sensors.iter().filter(|r| r.named || v.s.show_unnamed).collect();
-        let head = div()
-            .flex()
-            .items_center()
-            .gap(pt(8.))
-            .child(section("SENSORS", t))
-            .when(v.snap.ready, |el| el.child(div().text_size(pt(11.)).text_color(t.text_3).child(shown.len().to_string())));
-        if !v.snap.ready {
-            return div().flex().flex_col().gap(pt(8.)).child(head).child(
-                card(t).p(pt(16.)).flex().items_center().gap(pt(10.)).text_color(t.text_2).child(spinner("sensors-loading", 16., t)).child("Reading sensors…"),
-            );
-        }
-        // two columns, each group going to the shorter one
-        let mut cols: [(f32, Vec<Div>); 2] = [(0., vec![]), (0., vec![])];
-        for (g, (title, icon_name)) in GROUPS.iter().enumerate() {
+        let shown = v.snap.sensors.iter().filter(|r| r.named || v.s.show_unnamed).count();
+        let mut list = div().id("sensor-list").flex_1().min_h_0().overflow_y_scroll().flex().flex_col();
+        for (g, (title, _)) in GROUPS.iter().enumerate() {
             if g == 4 && !v.s.show_unnamed {
                 continue;
             }
-            let rows: Vec<&Reading> = shown.iter().copied().filter(|r| group_of(r) == g).collect();
+            let rows: Vec<&Reading> = v.snap.sensors.iter().filter(|r| group_of(r) == g).collect();
             if rows.is_empty() {
                 continue;
             }
+            list = list.child(div().mt(pt(10.)).mb(pt(2.)).text_size(pt(10.5)).text_color(t.text_3).child(title.to_uppercase()));
             let n = rows.len();
-            let list = rows.into_iter().enumerate().map(|(i, r)| {
+            for (i, r) in rows.into_iter().enumerate() {
                 let color = t.temp(r.value);
-                div()
-                    .id(SharedString::from(format!("sensor-{}", r.key)))
-                    .h(pt(30.))
-                    .px(pt(14.))
-                    .flex()
-                    .items_center()
-                    .gap(pt(10.))
-                    .hover(|s| s.bg(t.hover))
-                    .when(i + 1 < n, |el| el.border_b_1().border_color(t.border))
-                    .when(i + 1 == n, |el| el.rounded_b(pt(14.)))
-                    .tooltip(tip(format!("SMC key {}", r.key), t))
-                    .child(div().size(pt(7.)).flex_none().rounded_full().bg(color))
-                    .child(div().flex_1().min_w_0().ellipsis().text_size(pt(12.5)).child(elided(display_name(r).to_string())))
-                    .child(div().text_size(pt(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(color).child(v.temp(r.value)))
-            });
-            let group = card(t)
-                .overflow_hidden()
-                .child(
+                list = list.child(
                     div()
-                        .h(pt(36.))
-                        .px(pt(14.))
+                        .id(SharedString::from(format!("sensor-{}", r.key)))
+                        .relative()
+                        .flex_none()
+                        .h(pt(30.))
+                        .pl(pt(1.))
+                        .pr(pt(6.))
+                        .rounded(pt(6.))
                         .flex()
                         .items_center()
-                        .gap(pt(8.))
-                        // overflow clipping is square, so the header rounds its own top corners
-                        .rounded_t(pt(14.))
-                        .bg(t.surface_2)
-                        .border_b_1()
-                        .border_color(t.border)
-                        .child(icon(icon_name, 14., t.text_2))
-                        .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(*title))
-                        .child(div().text_size(pt(12.)).text_color(t.text_3).child(n.to_string())),
-                )
-                .children(list);
-            let k = if cols[0].0 <= cols[1].0 { 0 } else { 1 };
-            cols[k].0 += n as f32 + 2.;
-            cols[k].1.push(group);
+                        .gap(pt(10.))
+                        .hover(|s| s.bg(t.hover))
+                        .tooltip(tip(format!("SMC key {}", r.key), t))
+                        .child(div().size(pt(6.)).flex_none().rounded_full().bg(color))
+                        .child(div().flex_1().min_w_0().ellipsis().text_color(mix(t.text_2, t.text, 0.6)).child(elided(display_name(r).to_string())))
+                        .child(num(13.).text_color(color).child(v.temp(r.value)))
+                        .when(i + 1 < n, |el| el.child(div().absolute().bottom_0().left(pt(16.)).right_0().h(pt(1.)).bg(t.border.opacity(0.6)))),
+                );
+            }
         }
-        let [(_, a), (_, b)] = cols;
-        div().flex().flex_col().gap(pt(8.)).child(head).child(
-            div()
+        div().w(SENSORS_W).flex_none().h_full().pr(pt(20.)).pt(pt(6.)).pb(pt(20.)).child(
+            panel(t)
+                .size_full()
+                .p(pt(18.))
                 .flex()
-                .items_start()
-                .gap(pt(16.))
-                .child(div().flex_1().min_w_0().flex().flex_col().gap(pt(16.)).children(a))
-                .child(div().flex_1().min_w_0().flex().flex_col().gap(pt(16.)).children(b)),
-        )
-    }
-
-    /* ================================================================
-       Toolbar (Mac Cleaner's zoom and theme controls, plus Preferences)
-       ================================================================ */
-
-    /// One button showing the current appearance; it opens a menu to pick Light, Dark or Match System.
-    fn theme_switch(&self, t: &Theme, cx: &mut Context<Self>) -> Div {
-        let current = self.prefs.theme;
-        let icon_name = match current {
-            ThemeMode::Light => "sun",
-            ThemeMode::Dark => "moon",
-            ThemeMode::System => "auto",
-        };
-        let items = move || -> Vec<PopItem> {
-            [(ThemeMode::Light, "Light"), (ThemeMode::Dark, "Dark"), (ThemeMode::System, "Match System")]
-                .into_iter()
-                .map(|(mode, label)| PopItem { label: label.into(), checked: mode == current, cmd: Cmd::Theme(mode) })
-                .collect()
-        };
-        div().p(pt(2.)).rounded(pt(8.)).bg(t.border).child(
-            div()
-                .id("theme")
-                .w(pt(32.))
-                .h(pt(24.))
-                .rounded(pt(6.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|s| s.bg(t.hover))
-                .child(icon(icon_name, 14., t.text_2))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        this.popup = Some(Popup { pos: event.position, width: 216., items: items() });
-                        cx.notify();
-                    }),
-                ),
-        )
-    }
-
-    /// − 100% + control next to the theme switch. Clicking the percentage goes back to 100%.
-    fn zoom_switch(&self, t: &Theme, cx: &mut Context<Self>) -> Div {
-        let (smallest, largest) = (ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
-        let zoom = self.prefs.zoom;
-        let step = |id: &'static str, icon_name: &'static str, delta: i32, enabled: bool, cx: &mut Context<Self>| {
-            step_button(id, icon_name, enabled, t)
-                .when(enabled, |el| el.on_click(cx.listener(move |this, _, window, cx| this.step_zoom(delta, window, cx))))
-        };
-        segmented(t)
-            .child(step("zoom-out", "minus", -1, zoom > smallest + 0.001, cx))
-            .child(
-                div()
-                    .id("zoom-reset")
-                    .w(pt(44.))
-                    .h(pt(24.))
-                    .rounded(pt(6.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(t.hover))
-                    .text_size(pt(11.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(t.text_2)
-                    .child(format!("{}%", (zoom * 100.).round()))
-                    .on_click(cx.listener(|this, _, window, cx| this.set_zoom(1., window, cx))),
-            )
-            .child(step("zoom-in", "plus", 1, zoom < largest - 0.001, cx))
-    }
-
-    fn prefs_button(&self, t: &Theme, cx: &mut Context<Self>) -> Div {
-        div().p(pt(2.)).rounded(pt(8.)).bg(t.border).child(
-            div()
-                .id("prefs")
-                .w(pt(32.))
-                .h(pt(24.))
-                .rounded(pt(6.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|s| s.bg(t.hover))
-                .tooltip(tip("Preferences (⌘,)", t))
-                .child(icon("gear", 15., t.text_2))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.popup = None;
-                    this.modal = Modal::Prefs;
-                    cx.notify();
-                })),
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(div().text_size(pt(16.)).child("Sensors"))
+                        .child(div().flex_1())
+                        .when(v.snap.ready, |el| el.child(num(12.).text_color(t.text_3).child(shown.to_string()))),
+                )
+                .when(!v.snap.ready, |el| {
+                    el.child(div().mt(pt(8.)).flex().items_center().gap(pt(8.)).child(spinner("sensors-loading", 14., t)).child(div().text_color(t.text_2).child("Reading sensors…")))
+                })
+                .child(list),
         )
     }
 
@@ -1285,24 +1082,15 @@ impl Main {
         };
 
         Some(
-            modal_frame(t, pt(460.), max_h)
+            modal_frame(t, pt(464.), max_h)
                 .child(
                     div()
-                        .flex()
-                        .items_start()
-                        .gap(pt(16.))
-                        .p(pt(24.))
-                        .pb(pt(16.))
-                        .child(tile_lg("fan", "fan"))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(div().text_size(pt(17.)).font_weight(FontWeight::BOLD).child(format!("{} fan", fan.name)))
-                                .child(div().mt(pt(4.)).text_color(t.text_2).child("Choose how this fan should run.")),
-                        ),
+                        .p(pt(22.))
+                        .pb(pt(10.))
+                        .child(div().text_size(pt(18.)).child(format!("{} fan", fan.name)))
+                        .child(div().text_size(pt(12.5)).text_color(t.text_2).child("Choose how this fan should run.")),
                 )
-                .child(div().id("fan-body").flex_1().min_h_0().overflow_y_scroll().px(pt(24.)).flex().flex_col().gap(pt(16.)).child(kinds).child(body).when(
+                .child(div().id("fan-body").flex_1().min_h_0().overflow_y_scroll().px(pt(22.)).flex().flex_col().gap(pt(14.)).child(kinds).child(body).when(
                     !v.snap.can_control,
                     |el| {
                         el.child(
@@ -1315,7 +1103,7 @@ impl Main {
                                 .items_start()
                                 .gap(pt(10.))
                                 .child(div().mt(pt(1.)).child(icon("alert", 16., t.warning)))
-                                .child(div().flex_1().min_w_0().line_height(pt(19.)).child("Turn on fan control first: click “Enable fan control” in the sidebar.")),
+                                .child(div().flex_1().min_w_0().line_height(pt(19.)).child("Turn on fan control first: click “Enable fan control” at the top.")),
                         )
                     },
                 ))
@@ -1324,9 +1112,9 @@ impl Main {
                         .flex()
                         .items_center()
                         .gap(pt(8.))
-                        .p(pt(24.))
-                        .pt(pt(20.))
-                        .child(div().flex_1().text_size(pt(12.)).text_color(t.text_3).child("Press Esc to cancel"))
+                        .p(pt(22.))
+                        .pt(pt(16.))
+                        .child(div().flex_1())
                         .child(button("dlg-cancel", "Cancel", None, Btn::Secondary, true, t).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
                         .child(button("dlg-apply", "Apply", None, Btn::Primary, true, t).on_click(cx.listener(|this, _, _, cx| this.apply_dialog(cx)))),
                 ),
@@ -1335,12 +1123,12 @@ impl Main {
 
     fn prefs_dialog(&mut self, v: &V, t: &Theme, max_h: Pixels, cx: &mut Context<Self>) -> Stateful<Div> {
         let row = |label: &'static str, control: AnyDiv| {
-            div().min_h(pt(36.)).flex().items_center().gap(pt(16.)).child(div().flex_1().min_w_0().child(label)).child(control.0)
+            div().min_h(pt(32.)).flex().items_center().gap(pt(16.)).child(div().flex_1().min_w_0().text_color(t.text_2).child(label)).child(control.0)
         };
         let unit = segmented(t).w(pt(110.)).children([("°C", false), ("°F", true)].into_iter().enumerate().map(|(i, (label, f))| {
             segment(("unit", i), label, v.s.fahrenheit == f, t).on_click(cx.listener(move |this, _, _, cx| this.settings(cx, |s| s.fahrenheit = f)))
         }));
-        let theme = segmented(t).w(pt(220.)).children(
+        let theme = segmented(t).w(pt(186.)).children(
             [(ThemeMode::Light, "Light"), (ThemeMode::Dark, "Dark"), (ThemeMode::System, "Auto")].into_iter().enumerate().map(|(i, (mode, label))| {
                 segment(("appearance", i), label, self.prefs.theme == mode, t).on_click(cx.listener(move |this, _, _, cx| this.set_theme(mode, cx)))
             }),
@@ -1352,26 +1140,25 @@ impl Main {
                 .flex()
                 .items_center()
                 .gap(pt(16.))
-                .min_h(pt(36.))
-                .child(div().w(pt(130.)).flex_none().child(label))
+                .min_h(pt(32.))
+                .child(div().w(pt(122.)).flex_none().text_color(t.text_2).child(label))
                 .child(div().flex_1().child(this.slider(id, frac, t, cx)))
                 .child(div().w(pt(52.)).flex_none().text_right().font_weight(FontWeight::SEMIBOLD).child(v.temp(value)))
         };
         let lo = curve(self, "Cooling starts at", SliderId::SmartLo, v.s.smart_lo, ((v.s.smart_lo - 45.) / 40.) as f32, cx);
         let hi = curve(self, "Full speed at", SliderId::SmartHi, v.s.smart_hi, ((v.s.smart_hi - 60.) / 40.) as f32, cx);
         let text = |s: &'static str| div().text_size(pt(12.)).line_height(pt(17.)).text_color(t.text_2).child(s);
-        let heading = |s: &'static str| section(s, t).mt(pt(20.)).mb(pt(4.));
+        let heading = |s: &'static str| div().mt(pt(14.)).mb(pt(2.)).text_size(pt(10.5)).text_color(t.text_3).child(s);
 
-        modal_frame(t, pt(520.), max_h)
+        modal_frame(t, pt(424.), max_h)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(pt(16.))
-                    .p(pt(24.))
-                    .pb(pt(8.))
-                    .child(tile("settings", "gear", 36.))
-                    .child(div().flex_1().text_size(pt(17.)).font_weight(FontWeight::BOLD).child("Preferences")),
+                    .px(pt(22.))
+                    .pt(pt(20.))
+                    .child(div().flex_1().text_size(pt(18.)).child("Preferences"))
+                    .child(button("prefs-done", "Done", None, Btn::Secondary, true, t).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
             )
             .child(
                 div()
@@ -1379,7 +1166,8 @@ impl Main {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px(pt(24.))
+                    .px(pt(22.))
+                    .pb(pt(22.))
                     .flex()
                     .flex_col()
                     .child(heading("DISPLAY"))
@@ -1404,19 +1192,10 @@ impl Main {
                     })
                     .when(!v.installing && v.helper != helper::Status::NotInstalled, |el| {
                         el.child(div().mt(pt(10.)).flex().child(
-                            button("remove-helper", "Remove background helper", Some("trash"), Btn::Secondary, true, t)
+                            button("remove-helper", "Remove background helper", None, Btn::Secondary, true, t)
                                 .on_click(cx.listener(|this, _, _, cx| this.ctl.read(cx).request_uninstall())),
                         ))
                     }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .p(pt(24.))
-                    .pt(pt(20.))
-                    .child(div().flex_1())
-                    .child(button("prefs-done", "Done", None, Btn::Primary, true, t).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
             )
     }
 
@@ -1575,43 +1354,87 @@ impl Render for Main {
             .relative()
             .size_full()
             .flex()
-            .bg(t.bg)
+            .flex_col()
+            .bg(linear_gradient(180., linear_color_stop(t.bg, 0.), linear_color_stop(t.bg_bottom, 1.)))
             .text_color(t.text)
             .font_family(".SystemUIFont")
-            .text_size(pt(13.))
-            .line_height(relative(1.35))
-            .child(self.sidebar(&v, &t, cx))
-            .child(self.main_column(&v, &t, cx))
+            .text_size(pt(13.5))
+            .line_height(relative(1.3))
+            .child(self.titlebar(&v, &t, cx))
             .child(
                 div()
-                    .absolute()
-                    .top(pt(12.))
-                    .right(pt(16.))
+                    .flex_1()
+                    .min_h_0()
                     .flex()
-                    .items_center()
-                    .gap(pt(8.))
-                    .child(self.zoom_switch(&t, cx))
-                    .child(self.theme_switch(&t, cx))
-                    .child(self.prefs_button(&t, cx)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .gap(GAP)
+                            .pl(pt(20.))
+                            .pr(GAP)
+                            .pt(pt(6.))
+                            .pb(pt(20.))
+                            .child(self.hero(&v, &t))
+                            .child(self.mode_cards(&v, &t, cx))
+                            .child(self.fans(&v, &t, cx))
+                            .when_some(v.snap.error.clone(), |el, e| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .px(pt(14.))
+                                        .py(pt(9.))
+                                        .rounded(pt(10.))
+                                        .bg(t.danger.opacity(0.10))
+                                        .border_1()
+                                        .border_color(t.danger.opacity(0.24))
+                                        .text_size(pt(12.5))
+                                        .text_color(mix(t.danger, t.text, 0.35))
+                                        .child(e),
+                                )
+                            }),
+                    )
+                    .child(self.sensors(&v, &t)),
             )
             .when_some(modal, |el, card| {
+                // Like the original: dialogs float over the window without dimming it.
+                // Preferences hangs under the gear; the others are centred.
+                let prefs = self.modal == Modal::Prefs;
                 el.child(
                     div()
                         .id("backdrop")
                         .absolute()
                         .inset_0()
                         .occlude()
-                        .bg(t.backdrop)
                         .flex()
-                        .items_center()
-                        .justify_center()
-                        .p(pt(32.))
+                        .when(prefs, |el| el.justify_end().items_start().pt(pt(52.)).pr(pt(20.)))
+                        .when(!prefs, |el| el.items_center().justify_center().p(pt(32.)))
                         .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))
                         .child(card),
                 )
             })
             .when_some(popup, |el, layer| el.child(layer))
     }
+}
+
+/// SF Pro Rounded, for numbers (loaded at startup in main.rs).
+const ROUNDED: &str = ".SF NS Rounded";
+
+fn num(size: f32) -> Div {
+    div().font_family(ROUNDED).text_size(pt(size))
+}
+
+/// The original card: flat, with a hairline edge (a soft shadow in light mode).
+fn panel(t: &Theme) -> Div {
+    div()
+        .rounded(CARD_RADIUS)
+        .bg(t.surface)
+        .border_1()
+        .border_color(t.border)
+        .when(!t.dark, |el| el.shadow(small_shadow(t)))
 }
 
 /// A button that opens a popup menu (Mac Cleaner's dropdown).

@@ -47,16 +47,6 @@ impl Preset {
         }
     }
 
-    /// Tile colours (see `theme::tile_colors`) and icon.
-    pub fn tile(self) -> (&'static str, &'static str) {
-        match self {
-            Preset::Automatic => ("auto", "laptop"),
-            Preset::Smart => ("smart", "gauge"),
-            Preset::FullBlast => ("full", "wind"),
-            Preset::Custom => ("custom", "fan"),
-        }
-    }
-
     pub fn title(self) -> &'static str {
         match self {
             Preset::Automatic => "Apple Default",

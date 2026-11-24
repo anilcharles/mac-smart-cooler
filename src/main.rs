@@ -223,7 +223,7 @@ macro_rules! icons {
 }
 
 const ICONS: &[(&str, &[u8])] = icons![
-    "alert", "arrow-down", "arrow-right", "arrow-up", "auto", "battery", "check-bold", "chevron-down", "chip", "close",
+    "alert", "arrow-down", "arrow-right", "arrow-up", "auto", "battery", "check-bold", "check-circle", "chevron-down", "chip", "close",
     "fan", "gauge", "gear", "gpu", "laptop", "minus", "moon", "plus", "shield", "spinner", "sun", "thermometer", "trash",
     "wind",
 ];
@@ -257,6 +257,11 @@ fn run_gui() -> Result<(), String> {
     // Clicking the Dock icon brings the window back after it was closed.
     app.on_reopen(ui::open_window);
     app.run(move |cx: &mut gpui::App| {
+        // SF Pro Rounded for the numbers, as in the original window (not a named system family,
+        // so it is loaded from its file; without it the numbers use the system font).
+        if let Ok(bytes) = std::fs::read("/System/Library/Fonts/SFNSRounded.ttf") {
+            let _ = cx.text_system().add_fonts(vec![std::borrow::Cow::Owned(bytes)]);
+        }
         cx.bind_keys([
             KeyBinding::new("escape", Cancel, None),
             KeyBinding::new("enter", Confirm, None),
