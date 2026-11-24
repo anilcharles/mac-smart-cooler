@@ -1,54 +1,42 @@
-//! egui front-end.
-//!
-//! Visual language: a dark, layered window with a transparent title bar; soft cards with
-//! hairline borders and 16 px corners; SF Pro for text and SF Pro Rounded for numbers;
-//! one cool accent (blue/cyan) and a continuous teal -> amber -> red temperature scale.
+//! The window. Laid out like Mac Cleaner: a sidebar (status card, modes, this Mac) and a
+//! scrolling main column (current mode, live load, fans, sensors), with dialogs on a dimmed
+//! backdrop. Everything it shows comes from `state::Ctl`; every choice goes back to it.
 
+use crate::charts::{ring_gauge, sparkline};
+use crate::elided::elided;
 use crate::fans::FanInfo;
 use crate::helper;
 use crate::sensors::{Reading, HOT_KEY};
-use crate::settings::{self, Settings};
-use crate::smc::is_root;
-use crate::worker::{Cmd, FanMode, Snapshot, Worker};
-use eframe::egui::{
-    self, epaint::Shadow, Align, Align2, Color32, FontFamily, FontId, Id, Layout, Margin, Pos2,
-    Rect, Response, RichText, Rounding, Sense, Stroke, Vec2,
+use crate::settings::Settings;
+use crate::state::{thousands, Ctl, Preset, Shared, HIST_SECS};
+use crate::theme::*;
+use crate::ui_prefs::{ThemeMode, UiPrefs};
+use crate::widgets::*;
+use crate::worker::{FanMode, Snapshot};
+use gpui::{
+    actions, canvas, div, linear_color_stop, linear_gradient, point, prelude::*, relative, App, Bounds, ClickEvent, Context, Div, Entity,
+    FocusHandle, FontWeight, Global, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, SharedString, Size, Stateful, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
+    WindowHandle, WindowOptions,
 };
-use std::f32::consts::{PI, TAU};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
+use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
+
+actions!(
+    mac_smart_cooler,
+    [
+        Cancel, Confirm, Quit, About, Preferences, CloseWindow, Minimize, ThemeLight, ThemeDark, ThemeAuto, ZoomIn,
+        ZoomOut, ZoomReset, ModeAuto, ModeSmart, ModeFull
+    ]
+);
 
 pub const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
-// ---------------------------------------------------------------- palette & metrics
-
-const BG_TOP: Color32 = Color32::from_rgb(19, 20, 25);
-const BG_BOTTOM: Color32 = Color32::from_rgb(11, 12, 15);
-const CARD: Color32 = Color32::from_rgb(25, 27, 33);
-const RAISED: Color32 = Color32::from_rgb(34, 37, 44);
-const TRACK: Color32 = Color32::from_rgb(44, 47, 55);
-const TEXT: Color32 = Color32::from_rgb(242, 243, 246);
-const DIM: Color32 = Color32::from_rgb(152, 157, 168);
-const FAINT: Color32 = Color32::from_rgb(98, 103, 114);
-const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
-const CYAN: Color32 = Color32::from_rgb(100, 210, 255);
-const COOL: Color32 = Color32::from_rgb(48, 209, 160);
-const WARM: Color32 = Color32::from_rgb(255, 196, 64);
-const HOT: Color32 = Color32::from_rgb(255, 128, 64);
-const RED: Color32 = Color32::from_rgb(255, 69, 58);
-const GREEN: Color32 = Color32::from_rgb(48, 209, 88);
-const AMBER: Color32 = Color32::from_rgb(255, 196, 64);
-
-fn line() -> Color32 {
-    Color32::from_rgba_unmultiplied(255, 255, 255, 16)
-}
-
-const RADIUS: f32 = 10.0;
-const CARD_RADIUS: f32 = 16.0;
-const GAP: f32 = 14.0;
-const TITLEBAR: f32 = 30.0;
-const TEXT_SIZE: f32 = 13.5;
-const HIST_SECS: usize = 120;
+/// The window's rem size at 100% zoom; `pt()` in theme.rs divides by the same number.
+const BASE_REM: f32 = 16.;
 
 #[derive(PartialEq, Clone, Copy)]
 enum DialogKind {
@@ -65,450 +53,97 @@ struct CustomDialog {
     hi: f64,
 }
 
-#[derive(PartialEq, Clone, Copy, Debug)]
-enum Preset {
-    Automatic,
-    Smart,
-    FullBlast,
-    Custom,
+#[derive(PartialEq, Clone, Copy)]
+enum Modal {
+    None,
+    Fan,
+    Prefs,
+    About,
 }
 
-impl Preset {
-    fn key(self) -> &'static str {
-        match self {
-            Preset::Automatic => "auto",
-            Preset::Smart => "smart",
-            Preset::FullBlast => "full",
-            Preset::Custom => "custom",
-        }
-    }
-    fn from_key(k: &str) -> Option<Preset> {
-        match k {
-            "smart" => Some(Preset::Smart),
-            "full" => Some(Preset::FullBlast),
-            _ => None,
-        }
-    }
+/// Something a popup menu entry does.
+#[derive(Clone)]
+enum Cmd {
+    Sensor(String),
 }
 
-static INSTALLING: AtomicBool = AtomicBool::new(false);
-
-/// Install (or update) the background helper, off the UI thread. One password prompt.
-fn request_install(ctx: egui::Context) {
-    if INSTALLING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    std::thread::spawn(move || {
-        let _ = helper::install();
-        // give launchd a moment to start it, then let the UI refresh its status
-        std::thread::sleep(Duration::from_millis(1500));
-        INSTALLING.store(false, Ordering::SeqCst);
-        ctx.request_repaint();
-    });
+struct PopItem {
+    label: SharedString,
+    checked: bool,
+    cmd: Cmd,
 }
 
-fn request_uninstall(ctx: egui::Context) {
-    if INSTALLING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    std::thread::spawn(move || {
-        let _ = helper::uninstall();
-        INSTALLING.store(false, Ordering::SeqCst);
-        ctx.request_repaint();
-    });
+/// A small menu shown at a point in the window.
+struct Popup {
+    pos: Point<Pixels>,
+    width: f32,
+    items: Vec<PopItem>,
 }
 
-pub struct App {
-    helper: helper::Status,
-    helper_checked: Option<std::time::Instant>,
-    worker: Worker,
-    dialog: Option<CustomDialog>,
-    show_prefs: bool,
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum SliderId {
+    Rpm,
+    SmartLo,
+    SmartHi,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StepId {
+    Lo,
+    Hi,
+}
+
+/// What a frame draws, copied out of `Ctl` so the view can borrow `cx` freely.
+struct V {
+    snap: Snapshot,
     s: Settings,
-    saved: Settings,
-    pending: Option<Preset>,
-    /// settings handed to the helper since it became reachable (it keeps the system copy)
-    helper_synced: bool,
-    /// the preset just clicked, shown right away until the fans report it (or 4 s pass)
-    chosen: Option<(Preset, std::time::Instant)>,
-    /// asked once this launch to replace an outdated helper (so the latest cooling logic runs)
-    auto_updated: bool,
-    model: String,
-    /// smoothed rpm per fan, as displayed
+    preset: Preset,
+    helper: helper::Status,
+    installing: bool,
     rpm: Vec<Option<f32>>,
-    /// last ~2 minutes of each fan's rpm, one sample per second
-    hist: Vec<std::collections::VecDeque<f32>>,
-    hist_at: Option<std::time::Instant>,
-    /// menu bar item (none in screenshot mode)
-    tray: Option<crate::tray::Tray>,
-    /// Quit was chosen: let the window close for real instead of hiding to the menu bar
-    quitting: bool,
-    /// MACSMARTCOOLER_SHOT=path: render, save a PNG of the window, quit (for design review)
-    shot: Option<(String, std::time::Instant, bool)>,
+    hist: Vec<VecDeque<f32>>,
+    model: String,
+    model_id: String,
 }
 
-// ---------------------------------------------------------------- small helpers
-
-fn font(size: f32) -> FontId {
-    FontId::proportional(size)
-}
-
-/// SF Pro Rounded, for numbers.
-fn num(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("rounded".into()))
-}
-
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
-}
-
-fn tint(c: Color32, alpha: u8) -> Color32 {
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
-}
-
-/// Continuous temperature scale: teal (cool) -> amber -> orange -> red.
-fn temp_color(c: f64) -> Color32 {
-    let c = c as f32;
-    if c < 45.0 {
-        COOL
-    } else if c < 65.0 {
-        mix(COOL, WARM, (c - 45.0) / 20.0)
-    } else if c < 82.0 {
-        mix(WARM, HOT, (c - 65.0) / 17.0)
-    } else {
-        mix(HOT, RED, (c - 82.0) / 13.0)
-    }
-}
-
-fn load_color(f: f64) -> Color32 {
-    temp_color(40.0 + f * 45.0)
-}
-
-fn thousands(v: f64) -> String {
-    let n = v.max(0.0).round() as u64;
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
-}
-
-fn card_frame() -> egui::Frame {
-    egui::Frame::none()
-        .fill(CARD)
-        .stroke(Stroke::new(1.0_f32, line()))
-        .rounding(Rounding::same(CARD_RADIUS))
-        .inner_margin(Margin::same(18.0))
-}
-
-/// Use the macOS system fonts: SF Pro for text, SF Pro Rounded for numbers.
-fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    let mut add = |name: &str, paths: &[&str]| -> bool {
-        for p in paths {
-            if let Ok(bytes) = std::fs::read(p) {
-                fonts
-                    .font_data
-                    .insert(name.into(), egui::FontData::from_owned(bytes));
-                return true;
-            }
-        }
-        false
-    };
-    let system = add(
-        "system",
-        &["/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/HelveticaNeue.ttc"],
-    );
-    let rounded = add("rounded", &["/System/Library/Fonts/SFNSRounded.ttf"]);
-    if system {
-        if let Some(f) = fonts.families.get_mut(&FontFamily::Proportional) {
-            f.insert(0, "system".into());
+impl V {
+    fn of(c: &Ctl) -> Self {
+        V {
+            snap: c.snap.clone(),
+            s: c.s.clone(),
+            preset: c.preset,
+            helper: c.helper,
+            installing: c.installing(),
+            rpm: c.rpm.clone(),
+            hist: c.hist.clone(),
+            model: c.model.clone(),
+            model_id: c.model_id.clone(),
         }
     }
-    let mut r = fonts
-        .families
-        .get(&FontFamily::Proportional)
-        .cloned()
-        .unwrap_or_default();
-    if rounded {
-        r.insert(0, "rounded".into());
-    }
-    fonts.families.insert(FontFamily::Name("rounded".into()), r);
-    ctx.set_fonts(fonts);
-}
 
-/// Rounded button. `primary` = filled accent, otherwise a quiet raised surface.
-fn button(ui: &mut egui::Ui, text: &str, primary: bool) -> Response {
-    let fg = if primary { Color32::WHITE } else { TEXT };
-    let w = ui
-        .painter()
-        .layout_no_wrap(text.to_string(), font(13.0), fg)
-        .size()
-        .x
-        + 28.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w.max(72.0), 28.0), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-    let base = if primary { ACCENT } else { RAISED };
-    let fill = mix(base, Color32::WHITE, t * 0.08 + if resp.is_pointer_button_down_on() { 0.1 } else { 0.0 });
-    ui.painter().rect(rect, Rounding::same(8.0), fill, if primary { Stroke::NONE } else { Stroke::new(1.0_f32, line()) });
-    ui.painter()
-        .text(rect.center(), Align2::CENTER_CENTER, text, font(13.0), fg);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// Small rounded status pill with a dot.
-fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
-    let w = ui
-        .painter()
-        .layout_no_wrap(text.to_string(), font(12.0), color)
-        .size()
-        .x
-        + 30.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, Rounding::same(12.0), tint(color, 28));
-    ui.painter()
-        .circle_filled(rect.left_center() + Vec2::new(12.0, 0.0), 3.5, color);
-    ui.painter().text(
-        rect.left_center() + Vec2::new(21.0, 0.0),
-        Align2::LEFT_CENTER,
-        text,
-        font(12.0),
-        color,
-    );
-}
-
-/// Round icon button with a gear glyph.
-fn gear_button(ui: &mut egui::Ui) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-    let p = ui.painter();
-    p.circle(rect.center(), 14.0, mix(RAISED, Color32::WHITE, t * 0.08), Stroke::new(1.0_f32, line()));
-    let c = rect.center();
-    let col = mix(DIM, TEXT, t);
-    for k in 0..8 {
-        let a = k as f32 * TAU / 8.0;
-        let d = Vec2::new(a.cos(), a.sin());
-        p.line_segment([c + d * 4.5, c + d * 7.5], Stroke::new(2.6_f32, col));
-    }
-    p.circle_stroke(c, 4.6, Stroke::new(2.0_f32, col));
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("Preferences")
-}
-
-/// Compact segmented control with an animated sliding highlight. Returns the clicked index.
-fn segmented(ui: &mut egui::Ui, width: f32, id: Id, options: &[&str], selected: Option<usize>) -> Option<usize> {
-    let h = 26.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, h), Sense::hover());
-    let p = ui.painter().clone();
-    p.rect_filled(rect, Rounding::same(8.0), Color32::from_rgb(17, 18, 22));
-    let w = rect.width() / options.len() as f32;
-    if let Some(sel) = selected {
-        let x = ui.ctx().animate_value_with_time(id.with("x"), sel as f32, 0.18);
-        let r = Rect::from_min_size(rect.min + Vec2::new(w * x, 0.0), Vec2::new(w, h)).shrink(2.0);
-        p.rect_filled(r, Rounding::same(6.5), RAISED);
-    }
-    let mut clicked = None;
-    for (i, label) in options.iter().enumerate() {
-        let r = Rect::from_min_size(rect.min + Vec2::new(w * i as f32, 0.0), Vec2::new(w, h));
-        let resp = ui.interact(r, id.with(i), Sense::click());
-        let sel = selected == Some(i);
-        let col = if sel { TEXT } else if resp.hovered() { mix(DIM, TEXT, 0.5) } else { DIM };
-        p.text(r.center(), Align2::CENTER_CENTER, *label, font(12.0), col);
-        if resp.clicked() {
-            clicked = Some(i);
-        }
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    }
-    clicked
-}
-
-/// Stroke an arc (screen angles, clockwise) with round caps, coloured per segment.
-fn arc(p: &egui::Painter, c: Pos2, r: f32, a0: f32, a1: f32, width: f32, color: impl Fn(f32) -> Color32) {
-    let steps = (((a1 - a0).abs() / TAU) * 120.0).ceil().max(2.0) as usize;
-    let at = |a: f32| c + Vec2::new(a.cos(), a.sin()) * r;
-    for i in 0..steps {
-        let t0 = i as f32 / steps as f32;
-        let t1 = (i + 1) as f32 / steps as f32;
-        p.line_segment(
-            [at(a0 + (a1 - a0) * t0), at(a0 + (a1 - a0) * t1)],
-            Stroke::new(width, color((t0 + t1) / 2.0)),
-        );
-    }
-    p.circle_filled(at(a0), width / 2.0, color(0.0));
-    p.circle_filled(at(a1), width / 2.0, color(1.0));
-}
-
-/// Horizontal meter with rounded ends; `frac` 0..1.
-fn meter(p: &egui::Painter, r: Rect, frac: f32, from: Color32, to: Color32) {
-    let rr = Rounding::same(r.height() / 2.0);
-    p.rect_filled(r, rr, TRACK);
-    let frac = frac.clamp(0.0, 1.0);
-    if frac <= 0.0 {
-        return;
-    }
-    let w = (r.width() * frac).max(r.height());
-    let fill = Rect::from_min_size(r.min, Vec2::new(w, r.height()));
-    // gradient via a vertex-coloured mesh, clipped to a rounded shape by drawing caps
-    let mut mesh = egui::Mesh::default();
-    let end = mix(from, to, frac);
-    let (h, x0, x1) = (r.height() / 2.0, fill.left() + r.height() / 2.0, fill.right() - r.height() / 2.0);
-    let x1 = x1.max(x0);
-    mesh.colored_vertex(Pos2::new(x0, fill.top()), from);
-    mesh.colored_vertex(Pos2::new(x1, fill.top()), end);
-    mesh.colored_vertex(Pos2::new(x1, fill.bottom()), end);
-    mesh.colored_vertex(Pos2::new(x0, fill.bottom()), from);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    p.add(egui::Shape::mesh(mesh));
-    p.circle_filled(Pos2::new(x0, fill.center().y), h, from);
-    p.circle_filled(Pos2::new(x1, fill.center().y), h, end);
-}
-
-/// Area chart of recent values, newest on the right, scaled 0..max.
-fn sparkline(p: &egui::Painter, r: Rect, v: &std::collections::VecDeque<f32>, max: f32) {
-    // faint guide lines
-    for k in 1..4 {
-        let y = r.top() + r.height() * k as f32 / 4.0;
-        p.line_segment([Pos2::new(r.left(), y), Pos2::new(r.right(), y)], Stroke::new(1.0_f32, tint(Color32::WHITE, 6)));
-    }
-    let n = HIST_SECS as f32 - 1.0;
-    let start = HIST_SECS - v.len();
-    let pts: Vec<Pos2> = v
-        .iter()
-        .enumerate()
-        .map(|(i, &x)| {
-            Pos2::new(
-                r.left() + r.width() * (start + i) as f32 / n,
-                r.bottom() - r.height() * (x / max).clamp(0.0, 1.0),
-            )
-        })
-        .collect();
-    let mut mesh = egui::Mesh::default();
-    let top = tint(ACCENT, 70);
-    let bottom = tint(ACCENT, 0);
-    for (i, q) in pts.iter().enumerate() {
-        mesh.colored_vertex(*q, top);
-        mesh.colored_vertex(Pos2::new(q.x, r.bottom()), bottom);
-        if i > 0 {
-            let b = (i as u32) * 2;
-            mesh.add_triangle(b - 2, b - 1, b);
-            mesh.add_triangle(b - 1, b + 1, b);
+    fn temp(&self, c: f64) -> String {
+        if self.s.fahrenheit {
+            format!("{:.0}°F", c_to_f(c))
+        } else {
+            format!("{c:.0}°C")
         }
     }
-    p.add(egui::Shape::mesh(mesh));
-    p.add(egui::Shape::line(pts.clone(), Stroke::new(1.6_f32, CYAN)));
-    if let Some(last) = pts.last().filter(|_| v.back().is_some_and(|&x| x > 0.0)) {
-        p.circle_filled(*last, 3.0, CYAN);
-        p.circle_stroke(*last, 6.0, Stroke::new(1.0_f32, tint(CYAN, 70)));
-    }
-}
 
-/// One line of text cut to `max_w` with an ellipsis.
-fn elided(p: &egui::Painter, text: &str, font: FontId, color: Color32, max_w: f32) -> std::sync::Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
-    job.wrap = egui::text::TextWrapping {
-        max_width: max_w,
-        max_rows: 1,
-        break_anywhere: true,
-        overflow_character: Some('…'),
-    };
-    p.layout_job(job)
-}
-
-/// iOS-style switch.
-fn toggle(ui: &mut egui::Ui, on: &mut bool) -> Response {
-    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(38.0, 22.0), Sense::click());
-    if resp.clicked() {
-        *on = !*on;
-        resp.mark_changed();
+    fn deg(&self, c: f64) -> String {
+        if self.s.fahrenheit {
+            format!("{:.0}°", c_to_f(c))
+        } else {
+            format!("{c:.0}°")
+        }
     }
-    let t = ui.ctx().animate_bool_with_time(resp.id, *on, 0.15);
-    let p = ui.painter();
-    p.rect_filled(rect, Rounding::same(11.0), mix(TRACK, ACCENT, t));
-    let x = egui::lerp(rect.left() + 11.0..=rect.right() - 11.0, t);
-    p.circle_filled(Pos2::new(x, rect.center().y), 9.0, Color32::WHITE);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+
+    fn hot(&self) -> Option<f64> {
+        self.snap.sensors.iter().find(|r| r.key == HOT_KEY).map(|r| r.value)
+    }
 }
 
 fn c_to_f(c: f64) -> f64 {
     c * 9.0 / 5.0 + 32.0
-}
-
-/// Slider over a degC value that displays (and accepts typed values) in the chosen unit.
-fn unit_fmt(s: egui::Slider<'_>, fahrenheit: bool) -> egui::Slider<'_> {
-    if fahrenheit {
-        s.custom_formatter(|v, _| format!("{:.0} °F", c_to_f(v)))
-            .custom_parser(|t| t.trim().trim_end_matches("°F").trim().parse::<f64>().ok().map(|f| (f - 32.0) * 5.0 / 9.0))
-    } else {
-        s.custom_formatter(|v, _| format!("{v:.0} °C"))
-            .custom_parser(|t| t.trim().trim_end_matches("°C").trim().parse::<f64>().ok())
-    }
-}
-
-fn unit_drag(d: egui::DragValue<'_>, fahrenheit: bool) -> egui::DragValue<'_> {
-    if fahrenheit {
-        d.custom_formatter(|v, _| format!("{:.0} °F", c_to_f(v)))
-            .custom_parser(|t| t.trim().trim_end_matches("°F").trim().parse::<f64>().ok().map(|f| (f - 32.0) * 5.0 / 9.0))
-    } else {
-        d.custom_formatter(|v, _| format!("{v:.0} °C"))
-            .custom_parser(|t| t.trim().trim_end_matches("°C").trim().parse::<f64>().ok())
-    }
-}
-
-/// Thin-line fan glyph.
-fn paint_fan(p: &egui::Painter, c: Pos2, r: f32, angle: f32, spinning: bool) {
-    let blade = if spinning { CYAN } else { FAINT };
-    p.circle_filled(c, r, Color32::from_rgb(16, 17, 21));
-    p.circle_stroke(c, r, Stroke::new(1.2_f32, line()));
-    let at = |a: f32, rr: f32| c + Vec2::new(a.cos(), a.sin()) * rr;
-    for k in 0..5 {
-        let a = angle + k as f32 * TAU / 5.0;
-        p.add(egui::Shape::convex_polygon(
-            vec![
-                at(a, r * 0.28),
-                at(a + 0.6, r * 0.62),
-                at(a + 1.0, r * 0.86),
-                at(a + 0.45, r * 0.86),
-                at(a + 0.05, r * 0.52),
-            ],
-            tint(blade, if spinning { 220 } else { 160 }),
-            Stroke::NONE,
-        ));
-    }
-    p.circle_filled(c, r * 0.26, Color32::from_rgb(30, 32, 38));
-    p.circle_stroke(c, r * 0.26, Stroke::new(1.0_f32, tint(blade, 160)));
-}
-
-/// Mode glyphs for the three preset cards.
-fn paint_mode_icon(p: &egui::Painter, c: Pos2, which: usize, col: Color32) {
-    let s = Stroke::new(1.8_f32, col);
-    match which {
-        // Apple Default: a circle with a check-like "auto" tick
-        0 => {
-            p.circle_stroke(c, 9.0, s);
-            p.line_segment([c + Vec2::new(-4.0, 0.5), c + Vec2::new(-1.0, 3.5)], s);
-            p.line_segment([c + Vec2::new(-1.0, 3.5), c + Vec2::new(4.5, -3.0)], s);
-        }
-        // Smart: a gauge arc with a needle
-        1 => {
-            arc(p, c + Vec2::new(0.0, 2.0), 9.0, PI * 0.95, PI * 2.05, 1.8, |_| col);
-            p.line_segment([c + Vec2::new(0.0, 2.0), c + Vec2::new(4.5, -3.5)], s);
-            p.circle_filled(c + Vec2::new(0.0, 2.0), 2.0, col);
-        }
-        // Full Blast: wind lines
-        _ => {
-            for (dy, len) in [(-5.0, 14.0), (0.0, 18.0), (5.0, 11.0)] {
-                p.line_segment([c + Vec2::new(-9.0, dy), c + Vec2::new(-9.0 + len, dy)], s);
-            }
-        }
-    }
 }
 
 /// Friendlier names for a few sensors (display only; the helper is unaffected).
@@ -517,6 +152,7 @@ fn display_name(r: &Reading) -> &str {
         "TaLP" => "Case Air Left",
         "TaRF" => "Case Air Right",
         "TW0P" => "Wi-Fi Module",
+        HOT_KEY => "Hottest Core",
         _ => &r.name,
     }
 }
@@ -534,879 +170,171 @@ fn group_of(r: &Reading) -> usize {
         3
     }
 }
-const GROUPS: [&str; 5] = ["PROCESSOR", "GRAPHICS", "BATTERY", "SYSTEM", "UNIDENTIFIED"];
+const GROUPS: [(&str, &str); 5] =
+    [("Processor", "chip"), ("Graphics", "gpu"), ("Battery", "battery"), ("System", "laptop"), ("Unidentified", "thermometer")];
 
-/// Minimal PNG writer (stored deflate) for the screenshot/design-review mode.
-fn write_png(path: &str, img: &egui::ColorImage) -> std::io::Result<()> {
-    fn crc(data: &[u8]) -> u32 {
-        let mut c = 0xffff_ffffu32;
-        for &b in data {
-            c ^= b as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
-            }
-        }
-        !c
-    }
-    let [w, h] = img.size;
-    let mut raw = Vec::with_capacity((w * 3 + 1) * h);
-    for y in 0..h {
-        raw.push(0);
-        for x in 0..w {
-            let c = img.pixels[y * w + x];
-            raw.extend_from_slice(&[c.r(), c.g(), c.b()]);
+/// The open window, if any (the app keeps running without one).
+struct OpenWindow(Option<WindowHandle<Main>>);
+impl Global for OpenWindow {}
+
+/// Shows the window: brings the open one forward, or opens a new one on the same state.
+pub fn open_window(cx: &mut App) {
+    if let Some(h) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+        if h.update(cx, |_, window, _| window.activate_window()).is_ok() {
+            cx.activate(true);
+            return;
         }
     }
-    let mut z = vec![0x78, 0x01];
-    let chunks: Vec<&[u8]> = raw.chunks(65535).collect();
-    for (i, ch) in chunks.iter().enumerate() {
-        z.push((i + 1 == chunks.len()) as u8);
-        let n = ch.len() as u16;
-        z.extend_from_slice(&n.to_le_bytes());
-        z.extend_from_slice(&(!n).to_le_bytes());
-        z.extend_from_slice(ch);
+    let Some(ctl) = cx.try_global::<Shared>().map(|s| s.0.clone()) else { return };
+    let prefs = UiPrefs::load();
+    let bounds = Bounds::centered(None, window_size(WINDOW_SIZE, prefs.zoom), cx);
+    let handle = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Mac Smart Cooler".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(gpui::px(18.), gpui::px(18.))),
+            }),
+            window_min_size: Some(window_size(WINDOW_MIN, prefs.zoom)),
+            app_id: Some("local.macsmartcooler.app".into()),
+            ..Default::default()
+        },
+        |window, cx| {
+            cx.new(|cx| {
+                #[allow(unused_mut)]
+                let mut main = Main::new(ctl, prefs, window, cx);
+                // Debug builds only: a released app must not be steerable through its environment.
+                #[cfg(debug_assertions)]
+                if let Ok(dir) = std::env::var("MACSMARTCOOLER_SNAPSHOT_DIR") {
+                    main.start_demo(dir, window, cx);
+                }
+                main
+            })
+        },
+    );
+    if let Ok(h) = handle {
+        cx.set_global(OpenWindow(Some(h)));
     }
-    let (mut a, mut b) = (1u32, 0u32);
-    for &x in &raw {
-        a = (a + x as u32) % 65521;
-        b = (b + a) % 65521;
-    }
-    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
-    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut chunk = |ty: &[u8], data: &[u8]| {
-        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        let mut c = ty.to_vec();
-        c.extend_from_slice(data);
-        out.extend_from_slice(&c);
-        out.extend_from_slice(&crc(&c).to_be_bytes());
-    };
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
-    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-    chunk(b"IHDR", &ihdr);
-    chunk(b"IDAT", &z);
-    chunk(b"IEND", &[]);
-    std::fs::write(path, out)
+    cx.activate(true);
 }
 
-// ---------------------------------------------------------------- app
+pub struct Main {
+    ctl: Entity<Ctl>,
+    focus: FocusHandle,
+    prefs: UiPrefs,
+    modal: Modal,
+    dialog: Option<CustomDialog>,
+    popup: Option<Popup>,
+    /// the slider being dragged, and where each slider's track was last drawn
+    drag: Option<SliderId>,
+    tracks: HashMap<SliderId, Rc<Cell<Bounds<Pixels>>>>,
+    /// a stepper button held down (repeats), with a counter so an old repeat loop stops
+    hold: Option<(StepId, i32, u64)>,
+    hold_gen: u64,
+    app_icon: Arc<gpui::Image>,
+    _subs: Vec<Subscription>,
+}
 
-impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        install_fonts(&cc.egui_ctx);
-        let mut v = egui::Visuals::dark();
-        v.panel_fill = Color32::TRANSPARENT;
-        v.window_fill = Color32::from_rgb(28, 30, 36);
-        v.window_rounding = Rounding::same(CARD_RADIUS);
-        v.window_stroke = Stroke::new(1.0_f32, line());
-        v.window_shadow = Shadow {
-            offset: Vec2::new(0.0, 12.0),
-            blur: 40.0,
-            spread: 0.0,
-            color: Color32::from_black_alpha(140),
-        };
-        v.popup_shadow = v.window_shadow;
-        v.selection.bg_fill = ACCENT;
-        v.selection.stroke = Stroke::new(1.0_f32, CYAN);
-        v.override_text_color = Some(TEXT);
-        v.slider_trailing_fill = true;
-        v.extreme_bg_color = Color32::from_rgb(17, 18, 22);
-        for w in [
-            &mut v.widgets.noninteractive,
-            &mut v.widgets.inactive,
-            &mut v.widgets.hovered,
-            &mut v.widgets.active,
-            &mut v.widgets.open,
-        ] {
-            w.rounding = Rounding::same(8.0);
-        }
-        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, line());
-        v.widgets.inactive.weak_bg_fill = RAISED;
-        v.widgets.inactive.bg_fill = TRACK;
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, line());
-        v.widgets.hovered.weak_bg_fill = mix(RAISED, Color32::WHITE, 0.08);
-        v.widgets.hovered.bg_fill = mix(TRACK, Color32::WHITE, 0.1);
-        v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, tint(CYAN, 90));
-        v.widgets.active.bg_fill = ACCENT;
-        v.widgets.active.weak_bg_fill = mix(RAISED, Color32::WHITE, 0.12);
-        cc.egui_ctx.set_visuals(v);
-        cc.egui_ctx.style_mut(|st| {
-            st.spacing.item_spacing = Vec2::new(8.0, 8.0);
-            st.spacing.interact_size.y = 24.0;
-            st.spacing.button_padding = Vec2::new(10.0, 4.0);
-            st.text_styles.insert(egui::TextStyle::Body, font(TEXT_SIZE));
-            st.text_styles.insert(egui::TextStyle::Button, font(TEXT_SIZE));
+impl Main {
+    fn new(ctl: Entity<Ctl>, prefs: UiPrefs, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus = cx.focus_handle();
+        window.focus(&focus);
+        let entity = cx.entity().downgrade();
+        let appearance = window.observe_window_appearance(move |_, cx| {
+            entity.update(cx, |_, cx| cx.notify()).ok();
         });
-
-        let s = settings::load();
-        let pending = if is_root() {
-            Preset::from_key(&s.preset)
-        } else {
-            None
-        };
-        let helper = helper::status();
-        let ctx = cc.egui_ctx.clone();
-        let shot = std::env::var("MACSMARTCOOLER_SHOT")
-            .ok()
-            .map(|p| (p, std::time::Instant::now(), false));
-        let tray = if shot.is_none() {
-            let c = cc.egui_ctx.clone();
-            crate::tray::Tray::new(move || c.request_repaint())
-        } else {
-            None
-        };
-        App {
-            helper,
-            helper_checked: Some(std::time::Instant::now()),
-            worker: Worker::spawn(move || ctx.request_repaint()),
+        let observe = cx.observe(&ctl, |_, _, cx| cx.notify());
+        window.set_rem_size(gpui::px(BASE_REM * prefs.zoom));
+        Main {
+            ctl,
+            focus,
+            prefs,
+            modal: Modal::None,
             dialog: None,
-            show_prefs: std::env::var_os("MACSMARTCOOLER_SHOT_PREFS").is_some(),
-            saved: s.clone(),
-            s,
-            pending,
-            helper_synced: false,
-            chosen: None,
-            // never prompt for a password while just taking a screenshot
-            auto_updated: shot.is_some(),
-            model: crate::load::machine_title(),
-            rpm: Vec::new(),
-            hist: Vec::new(),
-            hist_at: None,
-            tray,
-            quitting: false,
-            shot,
+            popup: None,
+            drag: None,
+            tracks: HashMap::new(),
+            hold: None,
+            hold_gen: 0,
+            app_icon: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, ICON_PNG.to_vec())),
+            _subs: vec![appearance, observe],
         }
     }
 
-    fn temp(&self, c: f64) -> String {
-        if self.s.fahrenheit {
-            format!("{:.0}°F", c * 9.0 / 5.0 + 32.0)
-        } else {
-            format!("{c:.0}°C")
-        }
+    /* ================================================================
+       Actions
+       ================================================================ */
+
+    fn set_theme(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
+        self.prefs.theme = mode;
+        self.prefs.save();
+        cx.notify();
     }
 
-    /// Number only, with a degree sign (for big numerals).
-    fn deg(&self, c: f64) -> String {
-        if self.s.fahrenheit {
-            format!("{:.0}°", c * 9.0 / 5.0 + 32.0)
-        } else {
-            format!("{c:.0}°")
-        }
-    }
-
-    fn smart_mode(&self) -> FanMode {
-        FanMode::Smart {
-            lo: self.s.smart_lo,
-            hi: self.s.smart_hi,
-        }
-    }
-
-    fn preset(&self, snap: &Snapshot) -> Preset {
-        let all_auto = snap.modes.iter().all(|m| *m == FanMode::Auto);
-        if all_auto && snap.fans.iter().any(|f| f.manual) {
-            Preset::Custom // something else is driving the fans
-        } else if snap.modes.is_empty() || all_auto {
-            Preset::Automatic
-        } else if snap.modes.iter().all(|m| matches!(m, FanMode::Smart { .. })) {
-            Preset::Smart
-        } else if snap
-            .modes
-            .iter()
-            .zip(&snap.fans)
-            .all(|(m, f)| matches!(m, FanMode::Constant(r) if *r >= f.max))
-        {
-            Preset::FullBlast
-        } else {
-            Preset::Custom
-        }
-    }
-
-    fn apply_preset(&self, p: Preset, snap: &Snapshot) {
-        for f in &snap.fans {
-            let mode = match p {
-                Preset::Automatic => FanMode::Auto,
-                Preset::Smart => self.smart_mode(),
-                Preset::FullBlast => FanMode::Constant(f.max),
-                Preset::Custom => continue,
-            };
-            self.worker.send(Cmd::SetMode(f.index, mode));
-        }
-    }
-
-    fn choose_preset(&mut self, ctx: &egui::Context, p: Preset, snap: &Snapshot) {
-        self.s.preset = p.key().into();
-        settings::save(&self.s);
-        self.saved = self.s.clone();
-        if snap.can_control || p == Preset::Automatic {
-            self.chosen = Some((p, std::time::Instant::now()));
-            self.apply_preset(p, snap);
-        } else {
-            // applied as soon as the helper is up; only ask for the password if the
-            // helper is actually missing or outdated (not just still starting)
-            self.pending = Some(p);
-            if snap.root || matches!(helper::status(), helper::Status::NotInstalled | helper::Status::Outdated) {
-                request_install(ctx.clone());
-            }
-        }
-    }
-
-    fn screenshot_step(&mut self, ctx: &egui::Context, ready: bool) {
-        let Some((path, started, requested)) = self.shot.clone() else {
-            return;
-        };
-        for e in ctx.input(|i| i.raw.events.clone()) {
-            if let egui::Event::Screenshot { image, .. } = e {
-                if let Err(err) = write_png(&path, &image) {
-                    eprintln!("screenshot: {err}");
-                }
-                std::process::exit(0);
-            }
-        }
-        let wait = std::env::var("MACSMARTCOOLER_SHOT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(2.5);
-        if !requested && ready && started.elapsed() > Duration::from_secs_f64(wait) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
-            self.shot = Some((path, started, true));
-        }
-        ctx.request_repaint_after(Duration::from_millis(50));
-    }
-}
-
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        #[allow(unused_mut)]
-        let mut snap = self
-            .worker
-            .snapshot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        self.screenshot_step(ctx, snap.ready);
-        // MACSMARTCOOLER_SHOT_STATE (design review only, display-only, comma separated):
-        // error, outdated, nohelper, f, unnamed, size=WxH, preset=auto|full|custom
-        let shot_state = if self.shot.is_some() { std::env::var("MACSMARTCOOLER_SHOT_STATE").unwrap_or_default() } else { String::new() };
-        let has = |k: &str| shot_state.split(',').any(|x| x == k);
-        if has("error") {
-            snap.error = Some("Could not set Left side fan: SMC write failed (retrying in 30 s)".into());
-        }
-        if has("nohelper") {
-            snap.can_control = false;
-        }
-        if has("f") {
-            self.s.fahrenheit = true;
-        }
-        if has("unnamed") {
-            self.s.show_unnamed = true;
-        }
-        if let Some(sz) = shot_state.split(',').find_map(|x| x.strip_prefix("size=")) {
-            if let Some((w, h)) = sz.split_once('x') {
-                if let (Ok(w), Ok(h)) = (w.parse::<f32>(), h.parse::<f32>()) {
-                    if (ctx.screen_rect().width() - w).abs() > 1.0 {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(w, h)));
-                    }
-                }
-            }
-        }
-        // MACSMARTCOOLER_SHOT_DIALOG: open fan 0's dialog on the sensor page, then flip to fixed speed
-        let dialog_env = std::env::var("MACSMARTCOOLER_SHOT_DIALOG").ok();
-        if self.shot.is_some() && dialog_env.is_some() && snap.ready {
-            let keep_sensor = dialog_env.as_deref() == Some("sensor");
-            let el = self.shot.as_ref().map_or(0.0, |s| s.1.elapsed().as_secs_f32());
-            if self.dialog.is_none() && el < 1.5 {
-                if let Some(f) = snap.fans.first() {
-                    self.open_dialog(f, &FanMode::Auto);
-                    if let Some(d) = &mut self.dialog {
-                        d.kind = DialogKind::Sensor;
-                    }
-                }
-            } else if el > 1.5 && !keep_sensor {
-                if let Some(d) = &mut self.dialog {
-                    d.kind = DialogKind::Constant;
-                }
-            }
-        }
-
-        let installing = INSTALLING.load(Ordering::SeqCst);
-        if installing {
-            self.helper_checked = None;
-        } else if self
-            .helper_checked
-            .map_or(true, |t| t.elapsed() > Duration::from_secs(3))
-        {
-            self.helper = helper::status();
-            self.helper_checked = Some(std::time::Instant::now());
-            // The helper is what actually drives the fans; an old one keeps running old
-            // logic after the app is updated. Ask once per launch to replace it.
-            if self.helper == helper::Status::Outdated && !snap.root && !self.auto_updated {
-                self.auto_updated = true;
-                request_install(ctx.clone());
-            }
-        }
-        if self.helper != helper::Status::Installed && !snap.root {
-            ctx.request_repaint_after(Duration::from_secs(3)); // keep re-checking while not ready
-        }
-        if let Some(p) = self.pending {
-            if snap.ready && snap.can_control {
-                self.apply_preset(p, &snap);
-                self.pending = None;
-            }
-        }
-        // choices made before the helper was installed only reached the user's private copy
-        if snap.can_control && !snap.root && !self.helper_synced && self.shot.is_none() {
-            settings::save(&self.s);
-            self.helper_synced = true;
-        }
-
-        // Fan speed as shown: the tachometer wobbles +-20-50 rpm second to second even at a
-        // fixed target, so show a ~3 s average (rounded to 10 rpm when drawn). No continuous
-        // animation: the window only redraws when new readings arrive.
-        if snap.ready && self.hist_at.map_or(true, |t| t.elapsed() >= Duration::from_millis(900)) {
-            self.hist_at = Some(std::time::Instant::now());
-            self.rpm.resize(snap.fans.len(), None);
-            self.hist.resize(snap.fans.len(), Default::default());
-            for ((h, e), f) in self.hist.iter_mut().zip(self.rpm.iter_mut()).zip(&snap.fans) {
-                let a = f.actual as f32;
-                // jump straight to big changes (a real speed change), smooth the small wobble
-                let v = match *e {
-                    Some(p) if (a - p).abs() < 150.0 => p + (a - p) / 3.0,
-                    _ => a,
-                };
-                *e = Some(v);
-                h.push_back(v);
-                while h.len() > HIST_SECS {
-                    h.pop_front();
-                }
-            }
-        }
-
-        let mut preset = self.preset(&snap);
-        if let Some((p, t)) = self.chosen {
-            if p == preset || t.elapsed() > Duration::from_secs(4) {
-                self.chosen = None;
-            } else {
-                preset = p;
-                ctx.request_repaint_after(Duration::from_millis(100));
-            }
-        }
-        self.menu_bar(ctx, &snap, &mut preset);
-        if let Some(p) = shot_state.split(',').find_map(|x| x.strip_prefix("preset=")) {
-            preset = match p {
-                "auto" => Preset::Automatic,
-                "full" => Preset::FullBlast,
-                _ => Preset::Custom,
-            };
-        }
-        if has("outdated") {
-            self.helper = helper::Status::Outdated;
-        }
-
-        // ---------- window background: soft vertical gradient ----------
-        {
-            let r = ctx.screen_rect();
-            let p = ctx.layer_painter(egui::LayerId::background());
-            let mut mesh = egui::Mesh::default();
-            mesh.colored_vertex(r.left_top(), BG_TOP);
-            mesh.colored_vertex(r.right_top(), BG_TOP);
-            mesh.colored_vertex(r.right_bottom(), BG_BOTTOM);
-            mesh.colored_vertex(r.left_bottom(), BG_BOTTOM);
-            mesh.add_triangle(0, 1, 2);
-            mesh.add_triangle(0, 2, 3);
-            p.add(egui::Shape::mesh(mesh));
-        }
-
-        // ---------- title bar (transparent; traffic lights sit on the left) ----------
-        egui::TopBottomPanel::top("titlebar")
-            .show_separator_line(false)
-            .exact_height(TITLEBAR + 8.0)
-            .frame(egui::Frame::none().inner_margin(Margin {
-                left: 86.0,
-                right: 14.0,
-                top: 1.0,
-                bottom: 0.0,
-            }))
-            .show(ctx, |ui| {
-                // drag the window from anywhere in the bar
-                let bar = ui.max_rect();
-                let drag = ui.interact(bar, Id::new("titlebar_drag"), Sense::click_and_drag());
-                if drag.drag_started() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                if drag.double_clicked() {
-                    let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
-                }
-                ui.horizontal(|ui| {
-                    ui.set_height(28.0);
-                    ui.label(RichText::new("Mac Smart Cooler").font(font(14.0)).color(TEXT));
-                    ui.label(RichText::new(&self.model).font(font(12.0)).color(FAINT))
-                        .on_hover_text(format!("Model identifier: {}", crate::smc::hw_model()));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if gear_button(ui).clicked() {
-                            self.show_prefs = !self.show_prefs;
-                        }
-                        ui.add_space(2.0);
-                        if installing {
-                            pill(ui, "Waiting for password…", AMBER);
-                        } else if self.helper == helper::Status::Outdated && !snap.root {
-                            if button(ui, "Update helper", true)
-                                .on_hover_text("The background helper is older than this app. One password prompt updates it.")
-                                .clicked()
-                            {
-                                request_install(ctx.clone());
-                            }
-                        } else if self.helper == helper::Status::Unreachable && !snap.root {
-                            if button(ui, "Repair helper", true)
-                                .on_hover_text("The background helper isn't answering. One password prompt reinstalls it.")
-                                .clicked()
-                            {
-                                request_install(ctx.clone());
-                            }
-                        } else if snap.can_control {
-                            pill(ui, "Fan control on", GREEN);
-                        } else {
-                            if button(ui, "Enable fan control", true)
-                                .on_hover_text("Installs a small background helper. Asks for your password once, never again.")
-                                .clicked()
-                            {
-                                request_install(ctx.clone());
-                            }
-                            pill(ui, if snap.ready { "Monitoring only" } else { "Starting…" }, AMBER);
-                        }
-                    });
-                });
-            });
-
-        // ---------- sensors ----------
-        egui::SidePanel::right("sensors")
-            .show_separator_line(false)
-            .resizable(false)
-            .exact_width(320.0)
-            .frame(egui::Frame::none().inner_margin(Margin {
-                left: 0.0,
-                right: 20.0,
-                top: 6.0,
-                bottom: 20.0,
-            }))
-            .show(ctx, |ui| {
-                card_frame().show(ui, |ui| {
-                    ui.set_min_size(ui.available_size());
-                    self.sensors_list(ui, &snap);
-                });
-            });
-
-        // ---------- main column ----------
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().inner_margin(Margin {
-                left: 20.0,
-                right: GAP,
-                top: 6.0,
-                bottom: 20.0,
-            }))
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = GAP;
-                self.hero(ui, &snap, preset);
-                if let Some(p) = self.mode_cards(ui, preset) {
-                    self.choose_preset(ctx, p, &snap);
-                }
-                self.fan_cards(ui, &snap);
-                if let Some(e) = &snap.error {
-                    egui::Frame::none()
-                        .fill(tint(RED, 26))
-                        .stroke(Stroke::new(1.0_f32, tint(RED, 60)))
-                        .rounding(Rounding::same(RADIUS))
-                        .inner_margin(Margin::symmetric(14.0_f32, 9.0_f32))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(RichText::new(e).font(font(12.5)).color(mix(RED, TEXT, 0.35)));
-                        });
-                }
-            });
-
-        self.custom_dialog(ctx, &snap);
-        self.prefs_window(ctx, &snap, preset);
-
-        if self.s != self.saved && self.shot.is_none() {
-            settings::save(&self.s);
-            self.saved = self.s.clone();
-        }
-    }
-}
-
-impl App {
-    /// Menu bar item: handle clicks, keep its status and checkmarks current, and keep the
-    /// app running in the menu bar when the window is closed.
-    fn menu_bar(&mut self, ctx: &egui::Context, snap: &Snapshot, preset: &mut Preset) {
-        if self.tray.is_none() {
+    /// Makes the whole interface bigger or smaller. Every size is in rems, so changing the
+    /// window's rem size scales text, icons and spacing together.
+    fn set_zoom(&mut self, zoom: f32, window: &mut Window, cx: &mut Context<Self>) {
+        if (zoom - self.prefs.zoom).abs() < 0.001 {
             return;
         }
-        let actions = self.tray.as_ref().map(|t| t.actions()).unwrap_or_default();
-        for a in actions {
-            match a {
-                crate::tray::Action::Mode(i) => {
-                    let p = [Preset::Automatic, Preset::Smart, Preset::FullBlast][i];
-                    if p != *preset {
-                        self.choose_preset(ctx, p, snap);
-                        *preset = p;
-                    }
-                }
-                crate::tray::Action::Open => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                crate::tray::Action::Quit => {
-                    self.quitting = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
-        // closing the window hides it; Mac Smart Cooler keeps running in the menu bar
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
+        let old = self.prefs.zoom;
+        self.prefs.zoom = zoom;
+        self.prefs.save();
+        self.popup = None; // it was placed in pixels of the old size
+        window.set_rem_size(gpui::px(BASE_REM * zoom));
 
-        let hot = snap.sensors.iter().find(|r| r.key == HOT_KEY).map(|r| r.value);
-        let title = hot.map(|t| self.deg(t)).unwrap_or_default();
-        // one short line: "62°C · Fans off · Quiet"
-        let fans = if snap.fans.iter().all(|f| f.actual < 1.0) {
-            "Fans off".to_string()
+        let min = window_size(WINDOW_MIN, zoom);
+        crate::native::set_min_content_size(window, min.width.into(), min.height.into());
+        // The window grows and shrinks with its content, so the layout stays as it was.
+        if !window.is_fullscreen() && !window.is_maximized() {
+            let now = window.viewport_size();
+            let limit = window_size((f32::MAX, f32::MAX), 1.);
+            let k = zoom / old;
+            window.resize(gpui::size(
+                (now.width * k).min(limit.width).max(min.width),
+                (now.height * k).min(limit.height).max(min.height),
+            ));
+        }
+        cx.notify();
+    }
+
+    /// One zoom level up (`delta > 0`) or down.
+    fn step_zoom(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let next = if delta > 0 {
+            ZOOM_STEPS.iter().copied().find(|s| *s > self.prefs.zoom + 0.001)
         } else {
-            format!("{} rpm", snap.fans.iter().map(|f| thousands(f.actual)).collect::<Vec<_>>().join(" / "))
+            ZOOM_STEPS.iter().rev().copied().find(|s| *s < self.prefs.zoom - 0.001)
         };
-        let state = match *preset {
-            Preset::Automatic => "macOS".to_string(),
-            Preset::Smart => snap
-                .activity
-                .smart
-                .as_deref()
-                .and_then(|w| w.split(':').next())
-                .unwrap_or("Starting")
-                .to_string(),
-            Preset::FullBlast => "Full Blast".into(),
-            Preset::Custom => "Custom".into(),
-        };
-        let status = match hot {
-            Some(t) => format!("{} · {fans} · {state}", self.temp(t)),
-            None => "Reading sensors…".into(),
-        };
-        let sel = match *preset {
-            Preset::Automatic => Some(0),
-            Preset::Smart => Some(1),
-            Preset::FullBlast => Some(2),
-            Preset::Custom => None,
-        };
-        if let Some(t) = &mut self.tray {
-            t.update(&title, &status, sel);
+        if let Some(zoom) = next {
+            self.set_zoom(zoom, window, cx);
         }
     }
 
-    /// Big status card: hottest-core ring gauge, what Smart Cooling is doing, live load.
-    fn hero(&self, ui: &mut egui::Ui, snap: &Snapshot, preset: Preset) {
-        let a = &snap.activity;
-        let hot = snap.sensors.iter().find(|r| r.key == HOT_KEY).map(|r| r.value);
-        card_frame().inner_margin(Margin::same(22.0)).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                // ring gauge
-                let size = 148.0;
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-                let p = ui.painter();
-                let c = rect.center();
-                let r = size / 2.0 - 8.0;
-                let (a0, a1) = (PI * 0.75, PI * 2.25);
-                arc(p, c, r, a0, a1, 9.0, |_| TRACK);
-                if let Some(t) = hot {
-                    let shown = ui.ctx().animate_value_with_time(Id::new("gauge"), t as f32, 0.25);
-                    let frac = ((shown - 30.0) / 70.0).clamp(0.02, 1.0);
-                    arc(p, c, r, a0, a0 + (a1 - a0) * frac, 9.0, |u| {
-                        temp_color(30.0 + (u * frac * 70.0) as f64)
-                    });
-                    p.text(c + Vec2::new(0.0, -6.0), Align2::CENTER_CENTER, self.deg(shown as f64), num(40.0), TEXT);
-                    let arrow = if a.trend > 0.5 { "↑" } else if a.trend < -0.5 { "↓" } else { "→" };
-                    p.text(
-                        c + Vec2::new(0.0, 24.0),
-                        Align2::CENTER_CENTER,
-                        format!("{arrow} {:+.1}°/min", if self.s.fahrenheit { a.trend * 1.8 } else { a.trend }),
-                        num(12.0),
-                        DIM,
-                    );
-                    p.text(c + Vec2::new(0.0, r + 2.0), Align2::CENTER_CENTER, "HOTTEST CORE", font(10.0), FAINT);
-                } else {
-                    p.text(c, Align2::CENTER_CENTER, "—", num(36.0), FAINT);
-                }
+    fn choose(&mut self, p: Preset, cx: &mut Context<Self>) {
+        self.ctl.update(cx, |c, cx| c.choose_preset(p, cx));
+    }
 
-                ui.add_space(20.0);
-                ui.vertical(|ui| {
-                    ui.add_space(6.0);
-                    let (label, title, detail) = match preset {
-                        Preset::Automatic => (
-                            "APPLE DEFAULT",
-                            "macOS is in control".to_string(),
-                            "Fans follow Apple's own curve and often stay off until the chip is already hot.".to_string(),
-                        ),
-                        Preset::Smart => {
-                            let why = a.smart.clone().unwrap_or_else(|| "Quiet: starting up".into());
-                            let (t, d) = why.split_once(": ").unwrap_or((why.as_str(), ""));
-                            let mut d = d.to_string();
-                            if let Some(f) = d.get(0..1) {
-                                d = f.to_uppercase() + &d[1..];
-                            }
-                            ("SMART COOLING", t.to_string(), d)
-                        }
-                        Preset::FullBlast => ("FULL BLAST", "Maximum airflow".into(), "Every fan is running at full speed.".into()),
-                        Preset::Custom => ("CUSTOM", "Per-fan settings".into(), "Each fan follows its own setting below.".into()),
-                    };
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    ui.label(RichText::new(label).font(font(11.0)).color(CYAN));
-                    ui.label(RichText::new(title).font(font(26.0)).color(TEXT));
-                    ui.label(RichText::new(detail).font(font(13.0)).color(DIM));
-                    ui.add_space(16.0);
-
-                    // live meters
-                    let mut items: Vec<(&str, String, f32, Color32)> = vec![(
-                        "CPU",
-                        format!("{:.0}%", a.cpu * 100.0),
-                        a.cpu as f32,
-                        load_color(a.cpu),
-                    )];
-                    if let Some(g) = a.gpu {
-                        items.push(("GPU", format!("{:.0}%", g * 100.0), g as f32, load_color(g)));
-                    }
-                    if let Some(c) = a.chassis {
-                        items.push(("PALM REST", self.temp(c), ((c - 20.0) / 25.0) as f32, temp_color(c + 12.0)));
-                    }
-                    if let Some(b) = a.body {
-                        items.push(("CASE AIR", self.temp(b), ((b - 28.0) / 36.0) as f32, temp_color(b + 20.0)));
-                    }
-                    let w = ((ui.available_width() - 18.0 * (items.len() as f32 - 1.0)) / items.len() as f32).max(60.0);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 18.0;
-                        for (i, (label, value, frac, col)) in items.iter().enumerate() {
-                            let (r, _) = ui.allocate_exact_size(Vec2::new(w, 46.0), Sense::hover());
-                            let p = ui.painter();
-                            p.text(r.left_top(), Align2::LEFT_TOP, *label, font(10.0), FAINT);
-                            p.text(r.left_top() + Vec2::new(0.0, 14.0), Align2::LEFT_TOP, value, num(18.0), TEXT);
-                            let f = ui.ctx().animate_value_with_time(Id::new(("meter", i)), *frac, 0.25);
-                            meter(
-                                p,
-                                Rect::from_min_size(r.left_bottom() - Vec2::new(0.0, 4.0), Vec2::new(w, 4.0)),
-                                f,
-                                mix(*col, CARD, 0.35),
-                                *col,
-                            );
-                        }
-                    });
-                });
-            });
+    fn settings(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
+        self.ctl.update(cx, |c, cx| {
+            f(&mut c.s);
+            c.persist(cx);
+            cx.notify();
         });
     }
 
-    /// Three large preset cards. Returns the one clicked.
-    fn mode_cards(&self, ui: &mut egui::Ui, preset: Preset) -> Option<Preset> {
-        let opts = [
-            (Preset::Automatic, "Apple Default", "macOS decides"),
-            (Preset::Smart, "Smart Cooling", "Quiet until it matters"),
-            (Preset::FullBlast, "Full Blast", "Every fan at maximum"),
-        ];
-        let gap = 12.0;
-        let w = (ui.available_width() - gap * 2.0) / 3.0;
-        let mut out = None;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for (i, (p, title, sub)) in opts.iter().enumerate() {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 64.0), Sense::click());
-                let sel = preset == *p;
-                let hov = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-                let on = ui.ctx().animate_bool_with_time(resp.id.with("sel"), sel, 0.18);
-                let painter = ui.painter();
-                let fill = mix(mix(CARD, RAISED, hov * 0.6), mix(CARD, ACCENT, 0.16), on);
-                let stroke = Stroke::new(1.0 + on * 0.5, mix(line_solid(), ACCENT, on));
-                painter.rect(rect, Rounding::same(14.0), fill, stroke);
-                let icol = mix(DIM, CYAN, on);
-                let ic = rect.left_center() + Vec2::new(28.0, 0.0);
-                painter.circle_filled(ic, 17.0, mix(RAISED, ACCENT, on * 0.25));
-                paint_mode_icon(painter, ic, i, icol);
-                painter.text(rect.left_center() + Vec2::new(56.0, -8.0), Align2::LEFT_CENTER, *title, font(14.0), TEXT);
-                painter.text(rect.left_center() + Vec2::new(56.0, 10.0), Align2::LEFT_CENTER, *sub, font(11.5), mix(FAINT, DIM, on));
-                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !sel {
-                    out = Some(*p);
-                }
-            }
-        });
-        out
-    }
-
-    fn fan_cards(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
-        if snap.ready && snap.fans.is_empty() {
-            card_frame().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new("No fans found (fanless Mac?)").color(DIM));
-            });
+    fn open_dialog(&mut self, fan: &FanInfo, mode: &FanMode, cx: &mut Context<Self>) {
+        if !(fan.max > fan.min) {
             return;
         }
-        let n = snap.fans.len().max(1);
-        let gap = 12.0;
-        let w = (ui.available_width() - gap * (n as f32 - 1.0)) / n as f32;
-        let h = (ui.available_height() - if snap.error.is_some() { 52.0 } else { 0.0 }).max(150.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for fan in &snap.fans {
-                self.fan_card(ui, fan, snap, Vec2::new(w, h));
-            }
-        });
-    }
-
-    fn fan_card(&mut self, ui: &mut egui::Ui, fan: &FanInfo, snap: &Snapshot, size: Vec2) {
-        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-        let p = ui.painter().clone();
-        p.rect(rect, Rounding::same(CARD_RADIUS), CARD, Stroke::new(1.0_f32, line()));
-        let inner = rect.shrink(18.0);
-
-        let mode = snap.modes.get(fan.index).cloned().unwrap_or(FanMode::Auto);
-        let status = match &mode {
-            FanMode::Auto if fan.manual => "Set by another app".to_string(),
-            FanMode::Auto => "macOS".into(),
-            FanMode::Constant(r) => format!("Fixed {} rpm", thousands(*r)),
-            FanMode::Smart { .. } if fan.manual => "Smart Cooling · active".into(),
-            FanMode::Smart { .. } => "Smart Cooling · resting".into(),
-            FanMode::Sensor { key, lo, hi } => {
-                let name = snap
-                    .sensors
-                    .iter()
-                    .find(|r| &r.key == key)
-                    .map(|r| r.name.as_str())
-                    .unwrap_or(key);
-                format!("{name} {}–{}", self.temp(*lo), self.temp(*hi))
-            }
-        };
-
-        // header: glyph, name, status
-        let spinning = fan.actual > 0.0;
-        paint_fan(&p, inner.left_top() + Vec2::new(16.0, 16.0), 16.0, 0.3, spinning);
-        // Auto / Smart / Custom on the right; name and status get the rest, cut with "…" if needed
-        let seg_w = 186.0;
-        let text_w = (inner.width() - seg_w - 42.0 - 12.0).max(40.0);
-        let name = elided(&p, &fan.name, font(14.0), TEXT, text_w);
-        p.galley(inner.left_top() + Vec2::new(42.0, 7.0 - name.size().y / 2.0), name, TEXT);
-        let st = elided(&p, &status, font(11.5), FAINT, text_w);
-        p.galley(inner.left_top() + Vec2::new(42.0, 25.0 - st.size().y / 2.0), st, FAINT);
-
-        let mut seg_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(Rect::from_min_size(Pos2::new(inner.right() - seg_w, inner.top() + 3.0), Vec2::new(seg_w, 26.0)))
-                .layout(Layout::left_to_right(Align::Center)),
-        );
-        let is_auto = mode == FanMode::Auto && !fan.manual;
-        let is_smart = matches!(mode, FanMode::Smart { .. });
-        let sel = if is_auto { 0 } else if is_smart { 1 } else { 2 };
-        match segmented(&mut seg_ui, seg_w, Id::new(("fan_ctl", fan.index)), &["Auto", "Smart", "Custom"], Some(sel)) {
-            Some(0) if !is_auto => {
-                self.worker.send(Cmd::SetMode(fan.index, FanMode::Auto));
-            }
-            Some(1) if !is_smart => {
-                self.worker.send(Cmd::SetMode(fan.index, self.smart_mode()));
-            }
-            Some(2) => self.open_dialog(fan, &mode),
-            _ => {}
-        }
-
-        // big number + bar
-        let smooth = self.rpm.get(fan.index).copied().flatten().unwrap_or(fan.actual as f32);
-        let rpm = (smooth / 10.0).round() * 10.0;
-        let base = inner.left_bottom() - Vec2::new(0.0, 34.0);
-
-        // rpm history (last 2 minutes) in the space between header and number
-        let chart = Rect::from_min_max(
-            Pos2::new(inner.left(), inner.top() + 50.0),
-            Pos2::new(inner.right(), base.y - 52.0),
-        );
-        if chart.height() > 24.0 && fan.max > 0.0 {
-            if let Some(h) = self.hist.get(fan.index).filter(|h| h.len() >= 2) {
-                sparkline(&p, chart, h, fan.max as f32);
-            }
-            p.text(chart.left_top(), Align2::LEFT_TOP, "LAST 2 MIN", font(9.5), FAINT);
-        }
-        let g = p.text(base, Align2::LEFT_BOTTOM, thousands(rpm as f64), num(38.0), TEXT);
-        p.text(Pos2::new(g.right() + 6.0, g.bottom() - 8.0), Align2::LEFT_BOTTOM, "rpm", font(13.0), FAINT);
-        if fan.max > 0.0 {
-            let pct = (rpm as f64 / fan.max * 100.0).round();
-            p.text(Pos2::new(inner.right(), g.bottom() - 8.0), Align2::RIGHT_BOTTOM, format!("{pct:.0}%"), num(13.0), DIM);
-            let bar = Rect::from_min_size(inner.left_bottom() - Vec2::new(0.0, 22.0), Vec2::new(inner.width(), 6.0));
-            meter(&p, bar, (rpm as f64 / fan.max) as f32, ACCENT, CYAN);
-            let mx = bar.left() + bar.width() * (fan.min / fan.max).clamp(0.0, 1.0) as f32;
-            p.line_segment([Pos2::new(mx, bar.top() - 3.0), Pos2::new(mx, bar.bottom() + 3.0)], Stroke::new(1.5_f32, tint(TEXT, 120)));
-            p.text(inner.left_bottom(), Align2::LEFT_BOTTOM, format!("min {}", thousands(fan.min)), num(11.0), FAINT);
-            p.text(inner.right_bottom(), Align2::RIGHT_BOTTOM, format!("max {}", thousands(fan.max)), num(11.0), FAINT);
-        }
-    }
-
-    fn sensors_list(&self, ui: &mut egui::Ui, snap: &Snapshot) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Sensors").font(font(16.0)).color(TEXT));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let n = snap.sensors.iter().filter(|r| r.named || self.s.show_unnamed).count();
-                ui.label(RichText::new(format!("{n}")).font(num(12.0)).color(FAINT));
-            });
-        });
-        if !snap.ready {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("Reading sensors…").color(DIM));
-            });
-        }
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-            .show(ui, |ui| {
-                for (g, title) in GROUPS.iter().enumerate() {
-                    if g == 4 && !self.s.show_unnamed {
-                        continue;
-                    }
-                    let rows: Vec<&Reading> = snap.sensors.iter().filter(|r| group_of(r) == g).collect();
-                    if rows.is_empty() {
-                        continue;
-                    }
-                    ui.add_space(10.0);
-                    ui.label(RichText::new(*title).font(font(10.5)).color(FAINT));
-                    ui.add_space(2.0);
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for (i, r) in rows.iter().enumerate() {
-                        self.sensor_row(ui, r, i + 1 < rows.len());
-                    }
-                    ui.spacing_mut().item_spacing.y = 8.0;
-                }
-            });
-    }
-
-    fn sensor_row(&self, ui: &mut egui::Ui, r: &Reading, divider: bool) {
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width() - 6.0, 30.0), Sense::hover());
-        let p = ui.painter();
-        if resp.hovered() {
-            p.rect_filled(rect.expand2(Vec2::new(4.0, 0.0)), Rounding::same(6.0), tint(Color32::WHITE, 6));
-        }
-        let color = temp_color(r.value);
-        p.circle_filled(rect.left_center() + Vec2::new(4.0, 0.0), 3.0, color);
-        p.text(rect.left_center() + Vec2::new(16.0, 0.0), Align2::LEFT_CENTER, display_name(r), font(13.0), mix(DIM, TEXT, 0.6));
-        p.text(rect.right_center(), Align2::RIGHT_CENTER, self.temp(r.value), num(13.0), color);
-        if divider {
-            p.line_segment(
-                [rect.left_bottom() + Vec2::new(16.0, 0.0), rect.right_bottom()],
-                Stroke::new(1.0_f32, tint(Color32::WHITE, 9)),
-            );
-        }
-        resp.on_hover_text(format!("SMC key {}", r.key));
-    }
-
-    fn open_dialog(&mut self, fan: &FanInfo, mode: &FanMode) {
+        let s = &self.ctl.read(cx).s;
         let mut d = CustomDialog {
             fan: fan.index,
             kind: DialogKind::Constant,
             rpm: ((fan.min + fan.max) / 2.0 / 100.0).round() * 100.0,
             sensor: HOT_KEY.to_string(),
-            lo: self.s.smart_lo,
-            hi: self.s.smart_hi,
+            lo: s.smart_lo,
+            hi: s.smart_hi,
         };
         match mode {
             FanMode::Auto | FanMode::Smart { .. } => {}
@@ -1419,202 +347,1241 @@ impl App {
             }
         }
         self.dialog = Some(d);
+        self.popup = None;
+        self.modal = Modal::Fan;
+        cx.notify();
     }
 
-    fn custom_dialog(&mut self, ctx: &egui::Context, snap: &Snapshot) {
-        let Some(mut d) = self.dialog.take() else {
-            return;
+    fn apply_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = self.dialog.take() else { return };
+        let mode = match d.kind {
+            DialogKind::Constant => FanMode::Constant(d.rpm),
+            DialogKind::Sensor => FanMode::Sensor { key: d.sensor.clone(), lo: d.lo, hi: d.hi.max(d.lo + 1.0) },
         };
-        let Some(fan) = snap.fans.get(d.fan) else {
-            return;
-        };
-        if !(fan.max > fan.min) {
+        self.ctl.read(cx).send(d.fan, mode);
+        self.modal = Modal::None;
+        cx.notify();
+    }
+
+    fn close_modal(&mut self, cx: &mut Context<Self>) {
+        self.modal = Modal::None;
+        self.dialog = None;
+        self.popup = None;
+        self.drag = None;
+        self.hold = None;
+        cx.notify();
+    }
+
+    fn on_cancel(&mut self, cx: &mut Context<Self>) {
+        if self.popup.take().is_some() {
+            cx.notify();
+        } else if self.modal != Modal::None {
+            self.close_modal(cx);
+        }
+    }
+
+    fn run_cmd(&mut self, cmd: Cmd, cx: &mut Context<Self>) {
+        match cmd {
+            Cmd::Sensor(key) => {
+                if let Some(d) = &mut self.dialog {
+                    d.sensor = key;
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// A slider moved to window position `pos`.
+    fn slide(&mut self, id: SliderId, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(b) = self.tracks.get(&id).map(|c| c.get()) else { return };
+        let w = f32::from(b.size.width);
+        if w <= 0. {
             return;
         }
-        let mut keep = true;
-        // a fresh window id per page, so it sizes to that page instead of keeping the
-        // size of the taller one
-        egui::Window::new("custom_fan")
-            .id(Id::new(("custom_fan", d.kind == DialogKind::Constant)))
-            .title_bar(false)
-            .collapsible(false)
-            .auto_sized()
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(egui::Frame::window(&ctx.style()).inner_margin(Margin::same(22.0)))
-            .show(ctx, |ui| {
-                ui.set_width(420.0);
-                ui.label(RichText::new(format!("{} fan", fan.name)).font(font(18.0)));
-                ui.label(RichText::new("Choose how this fan should run.").font(font(12.5)).color(DIM));
-                ui.add_space(10.0);
-                let sel = segmented(ui, 420.0, Id::new("dlg_kind"), &["Fixed speed", "Follow a sensor"], Some(if d.kind == DialogKind::Constant { 0 } else { 1 }));
-                if let Some(i) = sel {
-                    d.kind = if i == 0 { DialogKind::Constant } else { DialogKind::Sensor };
+        let frac = (f32::from(pos.x - b.origin.x) / w).clamp(0., 1.) as f64;
+        match id {
+            SliderId::Rpm => {
+                let Some(fan) = self.dialog.as_ref().map(|d| d.fan) else { return };
+                let Some((min, max)) = self.ctl.read(cx).snap.fans.get(fan).map(|f| (f.min, f.max)) else { return };
+                if let Some(d) = &mut self.dialog {
+                    d.rpm = (((min + frac * (max - min)) / 50.0).round() * 50.0).clamp(min, max);
                 }
-                ui.add_space(14.0);
-                if d.kind == DialogKind::Constant {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(thousands(d.rpm)).font(num(30.0)));
-                        ui.label(RichText::new("rpm").color(FAINT));
-                    });
-                    ui.spacing_mut().slider_width = 420.0;
-                    ui.add(egui::Slider::new(&mut d.rpm, fan.min..=fan.max).step_by(50.0).show_value(false));
-                    d.rpm = ((d.rpm / 50.0).round() * 50.0).clamp(fan.min, fan.max);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("min {}", thousands(fan.min))).font(num(11.0)).color(FAINT));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(format!("max {}", thousands(fan.max))).font(num(11.0)).color(FAINT));
-                        });
-                    });
-                } else {
-                    let sel = snap
-                        .sensors
-                        .iter()
-                        .find(|r| r.key == d.sensor)
-                        .map(|r| display_name(r).to_string())
-                        .unwrap_or_else(|| d.sensor.clone());
-                    egui::ComboBox::new("sensor_pick", "")
-                        .selected_text(sel)
-                        .width(420.0)
-                        .show_ui(ui, |ui| {
-                            for r in snap.sensors.iter().filter(|r| r.named || self.s.show_unnamed) {
-                                ui.selectable_value(&mut d.sensor, r.key.clone(), format!("{}  ({})", display_name(r), self.temp(r.value)));
+                cx.notify();
+            }
+            SliderId::SmartLo | SliderId::SmartHi => {
+                let v = if id == SliderId::SmartLo { 45. + frac * 40. } else { 60. + frac * 40. }.round();
+                self.ctl.update(cx, |c, cx| {
+                    let slot = if id == SliderId::SmartLo { &mut c.s.smart_lo } else { &mut c.s.smart_hi };
+                    if *slot != v {
+                        *slot = v;
+                        c.smart_curve_changed(cx);
+                    }
+                });
+            }
+        }
+    }
+
+    /// One step of a temperature stepper: 1° in the unit shown.
+    fn step(&mut self, id: StepId, dir: i32, cx: &mut Context<Self>) {
+        let f = self.ctl.read(cx).s.fahrenheit;
+        let Some(d) = &mut self.dialog else { return };
+        let slot = if id == StepId::Lo { &mut d.lo } else { &mut d.hi };
+        let next = if f {
+            ((c_to_f(*slot).round() + dir as f64) - 32.0) * 5.0 / 9.0
+        } else {
+            slot.round() + dir as f64
+        };
+        *slot = next.clamp(20.0, 110.0);
+        cx.notify();
+    }
+
+    fn start_hold(&mut self, id: StepId, dir: i32, cx: &mut Context<Self>) {
+        self.step(id, dir, cx);
+        self.hold_gen += 1;
+        let gen = self.hold_gen;
+        self.hold = Some((id, dir, gen));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            loop {
+                let held = this
+                    .update(cx, |this, cx| {
+                        let still = this.hold.is_some_and(|(_, _, g)| g == gen);
+                        if still {
+                            this.step(id, dir, cx);
+                        }
+                        still
+                    })
+                    .unwrap_or(false);
+                if !held {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_millis(70)).await;
+            }
+        })
+        .detach();
+    }
+
+    /* ================================================================
+       Title bar (transparent; the traffic lights sit on the left)
+       ================================================================ */
+
+    fn titlebar(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
+        let prefs_open = self.modal == Modal::Prefs;
+        div()
+            .h(TITLEBAR)
+            .flex_none()
+            // the traffic lights are drawn by macOS at a fixed size, so their space is real pixels
+            .pl(gpui::px(86.))
+            .pr(pt(14.))
+            .pt(pt(1.))
+            .flex()
+            .items_center()
+            .gap(pt(8.))
+            .child(div().text_size(pt(14.)).child("Mac Smart Cooler"))
+            .child(
+                div()
+                    .id("model")
+                    .text_size(pt(12.))
+                    .text_color(t.text_3)
+                    .tooltip(tip(format!("Model identifier: {}", v.model_id), t))
+                    .child(v.model.clone()),
+            )
+            .child(div().flex_1())
+            .child(self.control_status(v, t, cx))
+            .child(
+                div()
+                    .id("prefs")
+                    .size(pt(28.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(if prefs_open { t.hover } else { t.surface_2 })
+                    .border_1()
+                    .border_color(t.border)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.hover))
+                    .tooltip(tip("Preferences", t))
+                    .child(icon("gear", 15., t.text_2))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let open = this.modal == Modal::Prefs;
+                        this.close_modal(cx);
+                        if !open {
+                            this.modal = Modal::Prefs;
+                        }
+                    })),
+            )
+    }
+
+    /// Fan control on, or the one button that gets it there.
+    fn control_status(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
+        let root = v.snap.root;
+        let install = |id: &'static str, label: &'static str, hint: &'static str, cx: &mut Context<Self>| {
+            button(id, label, None, Btn::Primary, true, t)
+                .tooltip(tip(hint, t))
+                .on_click(cx.listener(|this, _, _, cx| this.ctl.read(cx).request_install()))
+        };
+        let el = div().flex().items_center().gap(pt(8.));
+        if v.installing {
+            el.child(status_pill("Waiting for password…", t.warning))
+        } else if v.helper == helper::Status::Outdated && !root {
+            el.child(install(
+                "update-helper",
+                "Update helper",
+                "The background helper is older than this app. One password prompt updates it.",
+                cx,
+            ))
+        } else if v.helper == helper::Status::Unreachable && !root {
+            el.child(install(
+                "repair-helper",
+                "Repair helper",
+                "The background helper isn't answering. One password prompt reinstalls it.",
+                cx,
+            ))
+        } else if v.snap.can_control {
+            el.child(status_pill("Fan control on", t.success))
+        } else {
+            el.child(status_pill(if v.snap.ready { "Monitoring only" } else { "Starting…" }, t.warning)).child(install(
+                "enable",
+                "Enable fan control",
+                "Installs a small background helper. Asks for your password once, never again.",
+                cx,
+            ))
+        }
+    }
+
+    /* ================================================================
+       Main column
+       ================================================================ */
+
+    /// Big status card: hottest-core ring gauge, what the current mode is doing, live load.
+    fn hero(&self, v: &V, t: &Theme) -> Div {
+        let a = &v.snap.activity;
+        let hot = v.hot();
+        let arrow = if a.trend > 0.5 {
+            "↑"
+        } else if a.trend < -0.5 {
+            "↓"
+        } else {
+            "→"
+        };
+        let trend = if v.s.fahrenheit { a.trend * 1.8 } else { a.trend };
+        let gauge = div()
+            .relative()
+            .size(pt(148.))
+            .flex_none()
+            .child(div().absolute().inset_0().child(ring_gauge(hot, *t)))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .when_some(hot, |el, h| {
+                        el.child(num(40.).line_height(pt(46.)).child(v.deg(h)))
+                            .child(num(12.).text_color(t.text_2).child(format!("{arrow} {trend:+.1}°/min")))
+                    })
+                    .when(hot.is_none(), |el| el.child(num(36.).text_color(t.text_3).child("—"))),
+            )
+            .when(hot.is_some(), |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom(pt(6.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .text_size(pt(10.))
+                        .text_color(t.text_3)
+                        .child("HOTTEST CORE"),
+                )
+            });
+
+        let (label, title, detail): (&str, String, String) = match v.preset {
+            Preset::Automatic => (
+                "APPLE DEFAULT",
+                "macOS is in control".into(),
+                "Fans follow Apple's own curve and often stay off until the chip is already hot.".into(),
+            ),
+            Preset::Smart => {
+                let why = a.smart.clone().unwrap_or_else(|| "Quiet: starting up".into());
+                let (state, d) = why.split_once(": ").unwrap_or((why.as_str(), ""));
+                let mut d = d.to_string();
+                if let Some(f) = d.get(0..1) {
+                    d = f.to_uppercase() + &d[1..];
+                }
+                ("SMART COOLING", state.to_string(), d)
+            }
+            Preset::FullBlast => ("FULL BLAST", "Maximum airflow".into(), "Every fan is running at full speed.".into()),
+            Preset::Custom => ("CUSTOM", "Per-fan settings".into(), "Each fan follows its own setting below.".into()),
+        };
+
+        let mut items: Vec<(&str, String, f32, Hsla)> = vec![("CPU", format!("{:.0}%", a.cpu * 100.0), a.cpu as f32, t.load(a.cpu))];
+        if let Some(g) = a.gpu {
+            items.push(("GPU", format!("{:.0}%", g * 100.0), g as f32, t.load(g)));
+        }
+        if let Some(c) = a.chassis {
+            items.push(("PALM REST", v.temp(c), ((c - 20.0) / 25.0) as f32, t.temp(c + 12.0)));
+        }
+        if let Some(b) = a.body {
+            items.push(("CASE AIR", v.temp(b), ((b - 28.0) / 36.0) as f32, t.temp(b + 20.0)));
+        }
+        let meters = items.into_iter().map(|(label, value, frac, col)| {
+            div()
+                .flex_1()
+                .min_w(pt(60.))
+                .child(div().text_size(pt(10.)).text_color(t.text_3).child(label))
+                .child(num(18.).line_height(pt(24.)).child(value))
+                .child(
+                    div()
+                        .mt(pt(4.))
+                        .h(pt(4.))
+                        .rounded(pt(2.))
+                        .bg(t.well)
+                        .child(div().h_full().w(relative(frac.clamp(0.05, 1.))).rounded(pt(2.)).bg(gradient_h(mix(col, t.surface, 0.35), col))),
+                )
+        });
+
+        panel(t)
+            .p(pt(22.))
+            .flex()
+            .items_center()
+            .gap(pt(20.))
+            .child(gauge)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(pt(4.))
+                    .child(div().text_size(pt(11.)).text_color(t.cyan).child(label))
+                    .child(div().text_size(pt(26.)).line_height(pt(32.)).child(title))
+                    .child(div().text_color(t.text_2).child(detail))
+                    .child(div().mt(pt(12.)).flex().gap(pt(18.)).children(meters)),
+            )
+    }
+
+    /// The three presets as large cards.
+    fn mode_cards(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
+        let cards = Preset::ALL.into_iter().enumerate().map(|(i, p)| {
+            let sel = v.preset == p;
+            let glyph = ["check-circle", "gauge", "wind"][i];
+            let (fill, hover) = if sel { (mix(t.surface, t.accent, 0.16), mix(t.surface, t.accent, 0.16)) } else { (t.surface, mix(t.surface, t.surface_2, 0.6)) };
+            div()
+                .id(("mode", i))
+                .flex_1()
+                .min_w_0()
+                .h(pt(64.))
+                .px(pt(11.))
+                .rounded(pt(14.))
+                .bg(fill)
+                .border_1()
+                .border_color(if sel { t.accent } else { t.border })
+                .flex()
+                .items_center()
+                .gap(pt(12.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .when(!sel, |el| el.on_click(cx.listener(move |this, _, _, cx| this.choose(p, cx))))
+                .child(
+                    div()
+                        .size(pt(34.))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(if sel { mix(t.surface_2, t.accent, 0.25) } else { t.surface_2 })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon(glyph, 19., if sel { t.cyan } else { t.text_2 })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().ellipsis().text_size(pt(14.)).child(elided(p.title())))
+                        .child(
+                            div()
+                                .ellipsis()
+                                .text_size(pt(11.5))
+                                .text_color(if sel { t.text_2 } else { t.text_3 })
+                                .child(elided(p.subtitle())),
+                        ),
+                )
+        });
+        div().flex().gap(pt(12.)).children(cards)
+    }
+
+    fn fans(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
+        let row = div().flex_1().min_h(pt(150.)).flex().gap(pt(12.));
+        if !v.snap.ready || v.snap.fans.is_empty() {
+            let text = if v.snap.ready { "No fans found (fanless Mac?)" } else { "Reading fans…" };
+            return row.child(panel(t).flex_1().p(pt(18.)).text_color(t.text_2).child(text));
+        }
+        let cards: Vec<Div> = v.snap.fans.iter().map(|f| self.fan_card(f, v, t, cx)).collect();
+        row.children(cards)
+    }
+
+    fn fan_card(&self, fan: &FanInfo, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
+        let mode = v.snap.modes.get(fan.index).cloned().unwrap_or(FanMode::Auto);
+        let status = match &mode {
+            FanMode::Auto if fan.manual => "Set by another app".to_string(),
+            FanMode::Auto => "macOS".into(),
+            FanMode::Constant(r) => format!("Fixed {} rpm", thousands(*r)),
+            FanMode::Smart { .. } if fan.manual => "Smart Cooling · active".into(),
+            FanMode::Smart { .. } => "Smart Cooling · resting".into(),
+            FanMode::Sensor { key, lo, hi } => {
+                let name = v.snap.sensors.iter().find(|r| &r.key == key).map(display_name).unwrap_or(key);
+                format!("{name} {}–{}", v.temp(*lo), v.temp(*hi))
+            }
+        };
+        let is_auto = mode == FanMode::Auto && !fan.manual;
+        let is_smart = matches!(mode, FanMode::Smart { .. });
+        let sel = if is_auto { 0 } else if is_smart { 1 } else { 2 };
+        let idx = fan.index;
+        let switcher = segmented(t).w(pt(186.)).min_w(pt(168.)).flex_shrink().children(["Auto", "Smart", "Custom"].into_iter().enumerate().map(|(i, label)| {
+            let f = fan.clone();
+            let m = mode.clone();
+            segment(("fan-mode", idx * 8 + i), label, sel == i, t).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                match i {
+                    0 if !is_auto => this.ctl.read(cx).send(idx, FanMode::Auto),
+                    1 if !is_smart => {
+                        let c = this.ctl.read(cx);
+                        c.send(idx, c.smart_mode());
+                    }
+                    2 => this.open_dialog(&f, &m, cx),
+                    _ => {}
+                }
+            }))
+        }));
+
+        let smooth = v.rpm.get(idx).copied().flatten().unwrap_or(fan.actual as f32);
+        let rpm = (smooth / 10.0).round() * 10.0;
+        let frac = if fan.max > 0. { (rpm as f64 / fan.max).clamp(0., 1.) as f32 } else { 0. };
+        let min_frac = if fan.max > 0. { (fan.min / fan.max).clamp(0., 1.) as f32 } else { 0. };
+        let hist = v.hist.get(idx).cloned().unwrap_or_default();
+        let spinning = fan.actual > 0.;
+
+        panel(t)
+            .flex_1()
+            .min_w_0()
+            .p(pt(18.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(pt(10.))
+                    .child(
+                        div()
+                            .size(pt(32.))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(t.well)
+                            .border_1()
+                            .border_color(t.border)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon("fan", 22., if spinning { t.cyan } else { t.text_3 })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(pt(84.))
+                            .flex()
+                            .flex_col()
+                            .child(div().ellipsis().text_size(pt(14.)).child(elided(fan.name.clone())))
+                            .child(div().ellipsis().text_size(pt(11.5)).text_color(t.text_3).child(elided(status))),
+                    )
+                    .child(switcher),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(pt(24.))
+                    .mt(pt(18.))
+                    .mb(pt(10.))
+                    .child(div().absolute().inset_0().child(sparkline(hist, HIST_SECS, fan.max as f32, *t)))
+                    .child(div().absolute().top_0().left_0().text_size(pt(9.5)).text_color(t.text_3).child("LAST 2 MIN")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap(pt(6.))
+                    .child(num(38.).line_height(pt(42.)).child(thousands(rpm as f64)))
+                    .child(div().text_size(pt(13.)).text_color(t.text_3).child("rpm"))
+                    .child(div().flex_1())
+                    .when(fan.max > 0., |el| el.child(num(13.).text_color(t.text_2).child(format!("{:.0}%", frac * 100.)))),
+            )
+            .when(fan.max > 0., |el| {
+                el.child(
+                    div()
+                        .relative()
+                        .mt(pt(8.))
+                        .h(pt(6.))
+                        .rounded(pt(3.))
+                        .bg(t.well)
+                        .child(div().h_full().w(relative(frac.max(0.02))).rounded(pt(3.)).bg(gradient_h(t.accent, t.cyan)))
+                        .child(div().absolute().top(pt(-3.)).left(relative(min_frac)).w(pt(1.5)).h(pt(12.)).rounded(pt(1.)).bg(t.text_2)),
+                )
+                .child(
+                    div()
+                        .mt(pt(6.))
+                        .flex()
+                        .child(num(11.).text_color(t.text_3).child(format!("min {}", thousands(fan.min))))
+                        .child(div().flex_1())
+                        .child(num(11.).text_color(t.text_3).child(format!("max {}", thousands(fan.max)))),
+                )
+            })
+    }
+
+    /* ================================================================
+       Sensors (right column)
+       ================================================================ */
+
+    fn sensors(&self, v: &V, t: &Theme) -> Div {
+        let shown = v.snap.sensors.iter().filter(|r| r.named || v.s.show_unnamed).count();
+        let mut list = div().id("sensor-list").flex_1().min_h_0().overflow_y_scroll().flex().flex_col();
+        for (g, (title, _)) in GROUPS.iter().enumerate() {
+            if g == 4 && !v.s.show_unnamed {
+                continue;
+            }
+            let rows: Vec<&Reading> = v.snap.sensors.iter().filter(|r| group_of(r) == g).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            list = list.child(div().mt(pt(10.)).mb(pt(2.)).text_size(pt(10.5)).text_color(t.text_3).child(title.to_uppercase()));
+            let n = rows.len();
+            for (i, r) in rows.into_iter().enumerate() {
+                let color = t.temp(r.value);
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("sensor-{}", r.key)))
+                        .relative()
+                        .flex_none()
+                        .h(pt(30.))
+                        .pl(pt(1.))
+                        .pr(pt(6.))
+                        .rounded(pt(6.))
+                        .flex()
+                        .items_center()
+                        .gap(pt(10.))
+                        .hover(|s| s.bg(t.hover))
+                        .tooltip(tip(format!("SMC key {}", r.key), t))
+                        .child(div().size(pt(6.)).flex_none().rounded_full().bg(color))
+                        .child(div().flex_1().min_w_0().ellipsis().text_color(mix(t.text_2, t.text, 0.6)).child(elided(display_name(r).to_string())))
+                        .child(num(13.).text_color(color).child(v.temp(r.value)))
+                        .when(i + 1 < n, |el| el.child(div().absolute().bottom_0().left(pt(16.)).right_0().h(pt(1.)).bg(t.border.opacity(0.6)))),
+                );
+            }
+        }
+        div().w(SENSORS_W).flex_none().h_full().pr(pt(20.)).pt(pt(6.)).pb(pt(20.)).child(
+            panel(t)
+                .size_full()
+                .p(pt(18.))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(div().text_size(pt(16.)).child("Sensors"))
+                        .child(div().flex_1())
+                        .when(v.snap.ready, |el| el.child(num(12.).text_color(t.text_3).child(shown.to_string()))),
+                )
+                .when(!v.snap.ready, |el| {
+                    el.child(div().mt(pt(8.)).flex().items_center().gap(pt(8.)).child(spinner("sensors-loading", 14., t)).child(div().text_color(t.text_2).child("Reading sensors…")))
+                })
+                .child(list),
+        )
+    }
+
+    /* ================================================================
+       Inputs that need the view: sliders and steppers
+       ================================================================ */
+
+    /// A slider at `frac` (0..1). Dragging reports to `slide`; the track's bounds are
+    /// recorded as it is drawn, and while dragging, window-wide mouse events follow the
+    /// pointer even outside the track.
+    fn slider(&mut self, id: SliderId, frac: f32, t: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let cell = self.tracks.entry(id).or_insert_with(|| Rc::new(Cell::new(Bounds::default()))).clone();
+        let dragging = self.drag == Some(id);
+        let me: WeakEntity<Self> = cx.entity().downgrade();
+        div()
+            .id(SharedString::from(format!("slider-{id:?}")))
+            .relative()
+            .w_full()
+            .cursor_pointer()
+            .child(slider_track(frac, t))
+            .child(
+                canvas(
+                    move |bounds, _, _| cell.set(bounds),
+                    move |_, _, window, _| {
+                        if !dragging {
+                            return;
+                        }
+                        let m = me.clone();
+                        window.on_mouse_event(move |e: &MouseMoveEvent, _, _, cx| {
+                            if e.pressed_button == Some(MouseButton::Left) {
+                                m.update(cx, |this, cx| this.slide(id, e.position, cx)).ok();
                             }
                         });
-                    ui.add_space(6.0);
-                    egui::Grid::new("curve").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                        ui.label(RichText::new("Start speeding up at").color(DIM));
-                        ui.add(unit_drag(egui::DragValue::new(&mut d.lo).range(20.0..=110.0), self.s.fahrenheit));
-                        ui.end_row();
-                        ui.label(RichText::new("Full speed at").color(DIM));
-                        ui.add(unit_drag(egui::DragValue::new(&mut d.hi).range(20.0..=110.0), self.s.fahrenheit));
-                        ui.end_row();
-                    });
-                    ui.label(
-                        RichText::new(format!("Below {} the fan runs at its minimum ({} rpm).", self.temp(d.lo), thousands(fan.min)))
-                            .font(font(12.0))
-                            .color(FAINT),
-                    );
-                }
-                if !snap.can_control {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Enable fan control (top right) first.").color(AMBER));
-                }
-                ui.add_space(16.0);
-                // one row tall (a bare right-to-left layout would take all the height)
-                ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 28.0), Layout::right_to_left(Align::Center), |ui| {
-                    if button(ui, "Apply", true).clicked() {
-                        let mode = match d.kind {
-                            DialogKind::Constant => FanMode::Constant(d.rpm),
-                            DialogKind::Sensor => FanMode::Sensor {
-                                key: d.sensor.clone(),
-                                lo: d.lo,
-                                hi: d.hi.max(d.lo + 1.0),
-                            },
-                        };
-                        self.worker.send(Cmd::SetMode(d.fan, mode));
-                        keep = false;
-                    }
-                    if button(ui, "Cancel", false).clicked() {
-                        keep = false;
-                    }
-                });
-            });
-        if keep {
-            self.dialog = Some(d);
-        }
+                        let m = me.clone();
+                        window.on_mouse_event(move |e: &MouseUpEvent, _, _, cx| {
+                            if e.button == MouseButton::Left {
+                                m.update(cx, |this, cx| {
+                                    this.drag = None;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    this.drag = Some(id);
+                    this.slide(id, e.position, cx);
+                    cx.notify();
+                }),
+            )
     }
 
-    fn prefs_window(&mut self, ctx: &egui::Context, snap: &Snapshot, preset: Preset) {
-        if !self.show_prefs {
-            return;
-        }
-        let (old_lo, old_hi) = (self.s.smart_lo, self.s.smart_hi);
-        let mut close = false;
-        egui::Window::new("prefs")
-            .title_bar(false)
-            .collapsible(false)
-            .auto_sized()
-            .anchor(Align2::RIGHT_TOP, [-20.0, TITLEBAR + 14.0])
-            .frame(egui::Frame::window(&ctx.style()).inner_margin(Margin::same(22.0)))
-            .show(ctx, |ui| {
-                ui.set_width(380.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Preferences").font(font(18.0)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if button(ui, "Done", false).clicked() {
-                            close = true;
-                        }
-                    });
-                });
-                ui.add_space(8.0);
+    /// "− 60 °C +" with press-and-hold repeat.
+    fn stepper(&self, id: StepId, value: String, t: &Theme, cx: &mut Context<Self>) -> Div {
+        let btn = |name: &'static str, icon_name: &'static str, dir: i32, cx: &mut Context<Self>| {
+            step_button(SharedString::from(format!("{name}-{id:?}")), icon_name, true, t)
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.start_hold(id, dir, cx)))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.hold = None))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.hold = None))
+        };
+        segmented(t)
+            .flex_none()
+            .child(btn("dec", "minus", -1, cx))
+            .child(
+                div()
+                    .w(pt(64.))
+                    .h(pt(24.))
+                    .rounded(pt(6.))
+                    .bg(t.surface)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(pt(12.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(value),
+            )
+            .child(btn("inc", "plus", 1, cx))
+    }
 
-                ui.label(RichText::new("DISPLAY").font(font(10.5)).color(FAINT));
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Temperature unit").color(DIM));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if let Some(i) = segmented(ui, 110.0, Id::new("unit"), &["°C", "°F"], Some(self.s.fahrenheit as usize)) {
-                            self.s.fahrenheit = i == 1;
-                        }
-                    });
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Show unidentified SMC sensors").color(DIM));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        toggle(ui, &mut self.s.show_unnamed);
-                    });
-                });
+    /* ================================================================
+       Dialogs
+       ================================================================ */
 
-                ui.add_space(10.0);
-                ui.label(RichText::new("SMART COOLING").font(font(10.5)).color(FAINT));
-                ui.label(
-                    RichText::new(
-                        "Fans stay with macOS until the heat is real: warm air in the back of the case or a \
-                         warm palm rest while the Mac is busy, or minutes of heavy work with a hot chip. \
-                         Launches and brief spikes never spin them up. The temperatures below are for the chip.",
-                    )
-                    .font(font(12.0))
-                    .color(DIM),
-                );
-                ui.add_space(4.0);
-                ui.spacing_mut().slider_width = 220.0;
-                egui::Grid::new("smart").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
-                    ui.label(RichText::new("Cooling starts at").color(DIM));
-                    let f = self.s.fahrenheit;
-                    ui.add(unit_fmt(egui::Slider::new(&mut self.s.smart_lo, 45.0..=85.0), f));
-                    ui.end_row();
-                    ui.label(RichText::new("Full speed at").color(DIM));
-                    ui.add(unit_fmt(egui::Slider::new(&mut self.s.smart_hi, 60.0..=100.0), f));
-                    ui.end_row();
-                });
-
-                ui.add_space(10.0);
-                ui.label(RichText::new("BACKGROUND HELPER").font(font(10.5)).color(FAINT));
-                ui.label(
-                    RichText::new("Your mode keeps running after you quit Mac Smart Cooler and after restarts. Choose Apple Default to give the fans back to macOS.")
-                        .font(font(12.0))
-                        .color(DIM),
-                );
-                if self.helper != helper::Status::NotInstalled {
-                    ui.add_space(4.0);
-                    if button(ui, "Remove background helper", false).clicked() {
-                        request_uninstall(ctx.clone());
-                    }
+    fn fan_dialog(&mut self, v: &V, t: &Theme, max_h: Pixels, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let d = self.dialog.as_ref()?;
+        let fan = v.snap.fans.get(d.fan)?.clone();
+        let (kind, rpm, sensor, lo, hi) = (d.kind, d.rpm, d.sensor.clone(), d.lo, d.hi);
+        let kinds = segmented(t).children(["Fixed speed", "Follow a sensor"].into_iter().enumerate().map(|(i, label)| {
+            let k = if i == 0 { DialogKind::Constant } else { DialogKind::Sensor };
+            segment(("dlg-kind", i), label, kind == k, t).on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(d) = &mut this.dialog {
+                    d.kind = k;
                 }
-            });
-        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.show_prefs = false;
-        }
-        if self.s.smart_hi < self.s.smart_lo + 5.0 {
-            self.s.smart_hi = self.s.smart_lo + 5.0;
-        }
-        // keep Smart Cooling live while its curve is being edited
-        if preset == Preset::Smart && (old_lo != self.s.smart_lo || old_hi != self.s.smart_hi) {
-            self.apply_preset(Preset::Smart, snap);
-        }
+                this.popup = None;
+                cx.notify();
+            }))
+        }));
+
+        let body = if kind == DialogKind::Constant {
+            let frac = ((rpm - fan.min) / (fan.max - fan.min)) as f32;
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .gap(pt(6.))
+                        .child(div().text_size(pt(30.)).font_weight(FontWeight::BOLD).line_height(pt(36.)).child(thousands(rpm)))
+                        .child(div().text_color(t.text_3).child("rpm")),
+                )
+                .child(div().mt(pt(8.)).child(self.slider(SliderId::Rpm, frac, t, cx)))
+                .child(
+                    div()
+                        .mt(pt(4.))
+                        .flex()
+                        .text_size(pt(11.))
+                        .text_color(t.text_3)
+                        .child(format!("min {}", thousands(fan.min)))
+                        .child(div().flex_1())
+                        .child(format!("max {}", thousands(fan.max))),
+                )
+        } else {
+            let current = v
+                .snap
+                .sensors
+                .iter()
+                .find(|r| r.key == sensor)
+                .map(|r| format!("{}  ({})", display_name(r), v.temp(r.value)))
+                .unwrap_or_else(|| sensor.clone());
+            let choices: Vec<(String, String)> = v
+                .snap
+                .sensors
+                .iter()
+                .filter(|r| r.named || v.s.show_unnamed)
+                .map(|r| (r.key.clone(), format!("{}  ({})", display_name(r), v.temp(r.value))))
+                .collect();
+            let sel = sensor.clone();
+            let picker = dropdown("sensor-pick", current, t).w_full().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    let items = choices
+                        .iter()
+                        .map(|(k, label)| PopItem { label: label.clone().into(), checked: *k == sel, cmd: Cmd::Sensor(k.clone()) })
+                        .collect();
+                    this.popup = Some(Popup { pos: e.position, width: 300., items });
+                    cx.notify();
+                }),
+            );
+            let row = |label: &'static str, id: StepId, value: f64, cx: &mut Context<Self>| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(pt(12.))
+                    .child(div().flex_1().text_color(t.text_2).child(label))
+                    .child(self.stepper(id, v.temp(value), t, cx))
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap(pt(12.))
+                .child(div().flex().flex_col().gap(pt(6.)).child(div().text_color(t.text_2).child("Sensor")).child(picker))
+                .child(row("Start speeding up at", StepId::Lo, lo, cx))
+                .child(row("Full speed at", StepId::Hi, hi, cx))
+                .child(div().text_size(pt(12.)).line_height(pt(17.)).text_color(t.text_3).child(format!(
+                    "Below {} the fan runs at its minimum ({} rpm).",
+                    v.temp(lo),
+                    thousands(fan.min)
+                )))
+        };
+
+        Some(
+            modal_frame(t, pt(464.), max_h)
+                .child(
+                    div()
+                        .p(pt(22.))
+                        .pb(pt(10.))
+                        .child(div().text_size(pt(18.)).child(format!("{} fan", fan.name)))
+                        .child(div().text_size(pt(12.5)).text_color(t.text_2).child("Choose how this fan should run.")),
+                )
+                .child(div().id("fan-body").flex_1().min_h_0().overflow_y_scroll().px(pt(22.)).flex().flex_col().gap(pt(14.)).child(kinds).child(body).when(
+                    !v.snap.can_control,
+                    |el| {
+                        el.child(
+                            div()
+                                .px(pt(12.))
+                                .py(pt(10.))
+                                .rounded(pt(10.))
+                                .bg(t.warning_soft)
+                                .flex()
+                                .items_start()
+                                .gap(pt(10.))
+                                .child(div().mt(pt(1.)).child(icon("alert", 16., t.warning)))
+                                .child(div().flex_1().min_w_0().line_height(pt(19.)).child("Turn on fan control first: click “Enable fan control” at the top.")),
+                        )
+                    },
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(pt(8.))
+                        .p(pt(22.))
+                        .pt(pt(16.))
+                        .child(div().flex_1())
+                        .child(button("dlg-cancel", "Cancel", None, Btn::Secondary, true, t).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
+                        .child(button("dlg-apply", "Apply", None, Btn::Primary, true, t).on_click(cx.listener(|this, _, _, cx| this.apply_dialog(cx)))),
+                ),
+        )
+    }
+
+    fn prefs_dialog(&mut self, v: &V, t: &Theme, max_h: Pixels, cx: &mut Context<Self>) -> Stateful<Div> {
+        let row = |label: &'static str, control: AnyDiv| {
+            div().min_h(pt(32.)).flex().items_center().gap(pt(16.)).child(div().flex_1().min_w_0().text_color(t.text_2).child(label)).child(control.0)
+        };
+        let unit = segmented(t).w(pt(110.)).children([("°C", false), ("°F", true)].into_iter().enumerate().map(|(i, (label, f))| {
+            segment(("unit", i), label, v.s.fahrenheit == f, t).on_click(cx.listener(move |this, _, _, cx| this.settings(cx, |s| s.fahrenheit = f)))
+        }));
+        let theme = segmented(t).w(pt(186.)).children(
+            [(ThemeMode::Light, "Light"), (ThemeMode::Dark, "Dark"), (ThemeMode::System, "Auto")].into_iter().enumerate().map(|(i, (mode, label))| {
+                segment(("appearance", i), label, self.prefs.theme == mode, t).on_click(cx.listener(move |this, _, _, cx| this.set_theme(mode, cx)))
+            }),
+        );
+        let show_unnamed = v.s.show_unnamed;
+        let unnamed = switch("unnamed", show_unnamed, t).on_click(cx.listener(move |this, _, _, cx| this.settings(cx, |s| s.show_unnamed = !show_unnamed)));
+        let curve = |this: &mut Self, label: &'static str, id: SliderId, value: f64, frac: f32, cx: &mut Context<Self>| {
+            div()
+                .flex()
+                .items_center()
+                .gap(pt(16.))
+                .min_h(pt(32.))
+                .child(div().w(pt(122.)).flex_none().text_color(t.text_2).child(label))
+                .child(div().flex_1().child(this.slider(id, frac, t, cx)))
+                .child(div().w(pt(52.)).flex_none().text_right().font_weight(FontWeight::SEMIBOLD).child(v.temp(value)))
+        };
+        let lo = curve(self, "Cooling starts at", SliderId::SmartLo, v.s.smart_lo, ((v.s.smart_lo - 45.) / 40.) as f32, cx);
+        let hi = curve(self, "Full speed at", SliderId::SmartHi, v.s.smart_hi, ((v.s.smart_hi - 60.) / 40.) as f32, cx);
+        let text = |s: &'static str| div().text_size(pt(12.)).line_height(pt(17.)).text_color(t.text_2).child(s);
+        let heading = |s: &'static str| div().mt(pt(14.)).mb(pt(2.)).text_size(pt(10.5)).text_color(t.text_3).child(s);
+
+        modal_frame(t, pt(424.), max_h)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px(pt(22.))
+                    .pt(pt(20.))
+                    .child(div().flex_1().text_size(pt(18.)).child("Preferences"))
+                    .child(button("prefs-done", "Done", None, Btn::Secondary, true, t).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
+            )
+            .child(
+                div()
+                    .id("prefs-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(pt(22.))
+                    .pb(pt(22.))
+                    .flex()
+                    .flex_col()
+                    .child(heading("DISPLAY"))
+                    .child(row("Temperature unit", AnyDiv(unit)))
+                    .child(row("Appearance", AnyDiv(theme)))
+                    .child(row("Show unidentified SMC sensors", AnyDiv(div().child(unnamed))))
+                    .child(heading("SMART COOLING"))
+                    .child(text(
+                        "Fans stay with macOS until the heat is real: warm air in the back of the case or a warm palm rest \
+                         while the Mac is busy, or minutes of heavy work with a hot chip. Launches and brief spikes never spin \
+                         them up. The temperatures below are for the chip.",
+                    ))
+                    .child(div().mt(pt(6.)).child(lo))
+                    .child(hi)
+                    .child(heading("BACKGROUND HELPER"))
+                    .child(text(
+                        "Your mode keeps running after you quit Mac Smart Cooler and after restarts. Choose Apple Default to \
+                         give the fans back to macOS.",
+                    ))
+                    .when(v.installing, |el| {
+                        el.child(div().mt(pt(10.)).flex().items_center().gap(pt(8.)).child(spinner("prefs-wait", 14., t)).child(div().text_color(t.text_2).child("Waiting for your password…")))
+                    })
+                    .when(!v.installing && v.helper != helper::Status::NotInstalled, |el| {
+                        el.child(div().mt(pt(10.)).flex().child(
+                            button("remove-helper", "Remove background helper", None, Btn::Secondary, true, t)
+                                .on_click(cx.listener(|this, _, _, cx| this.ctl.read(cx).request_uninstall())),
+                        ))
+                    }),
+            )
+    }
+
+    fn about(&self, t: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        modal_frame(t, pt(360.), pt(440.)).child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .px(pt(28.))
+                .pt(pt(24.))
+                .pb(pt(24.))
+                .child(gpui::img(self.app_icon.clone()).size(pt(96.)))
+                .child(div().mt(pt(4.)).text_size(pt(20.)).font_weight(FontWeight::BOLD).child("Mac Smart Cooler"))
+                .child(div().mt(pt(2.)).text_color(t.text_3).child(format!("Version {}", env!("CARGO_PKG_VERSION"))))
+                .child(
+                    div()
+                        .mt(pt(14.))
+                        .mb(pt(20.))
+                        .text_center()
+                        .line_height(pt(19.))
+                        .text_color(t.text_2)
+                        .child("Fan control and temperatures for your Mac. Smart Cooling keeps the fans quiet until the heat is real."),
+                )
+                .child(button("about-close", "Close", None, Btn::Secondary, true, t).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
+        )
+    }
+
+    /// The open popup menu on a click-catching layer that closes it. Long menus scroll.
+    fn popup_layer(&self, t: &Theme, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let popup = self.popup.as_ref()?;
+        let zoom = self.prefs.zoom;
+        let any_checked = popup.items.iter().any(|i| i.checked);
+        // Placed at a mouse position, so these are real pixels at the current zoom.
+        let width = gpui::px(popup.width * zoom);
+        let margin = gpui::px(8. * zoom);
+        let height = gpui::px((10. + 28. * popup.items.len() as f32) * zoom).min(viewport.height - margin * 2.);
+        let x = popup.pos.x.min(viewport.width - width - margin).max(margin);
+        let y = popup.pos.y.min(viewport.height - height - margin).max(margin);
+
+        let items = popup.items.iter().enumerate().map(|(i, item)| {
+            let cmd = item.cmd.clone();
+            div()
+                .id(("popup-item", i))
+                .h(pt(28.))
+                .flex_none()
+                .px(pt(8.))
+                .rounded(pt(6.))
+                .flex()
+                .items_center()
+                .gap(pt(6.))
+                .cursor_pointer()
+                .hover(|s| s.bg(t.accent_soft))
+                .when(any_checked, |el| {
+                    el.child(div().w(pt(14.)).flex_none().when(item.checked, |d| d.child(icon("check-bold", 11., t.accent))))
+                })
+                .child(div().flex_1().min_w_0().ellipsis().child(elided(item.label.clone())))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.popup = None;
+                    cx.notify();
+                    this.run_cmd(cmd.clone(), cx);
+                }))
+        });
+
+        Some(
+            div()
+                .id("popup-layer")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.popup = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("popup")
+                        .absolute()
+                        .left(x)
+                        .top(y)
+                        .w(width)
+                        .h(height)
+                        .p(pt(4.))
+                        .rounded(pt(10.))
+                        .bg(t.surface)
+                        .border_1()
+                        .border_color(t.border_strong)
+                        .shadow(vec![shadow(rgba_hsla(0x00000030), 8., 24., t.scale)])
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .children(items),
+                ),
+        )
     }
 }
 
-/// Opaque equivalent of the hairline colour on a card, for blending.
-fn line_solid() -> Color32 {
-    Color32::from_rgb(45, 47, 54)
+/// A Div passed by value into a row builder.
+struct AnyDiv(Div);
+
+impl Render for Main {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut t = match self.prefs.theme {
+            ThemeMode::Light => Theme::light(),
+            ThemeMode::Dark => Theme::dark(),
+            ThemeMode::System => Theme::for_appearance(window.appearance()),
+        };
+        t.scale = self.prefs.zoom;
+        // Keyboard shortcuts and menu items reach this view through its focus.
+        if !self.focus.is_focused(window) {
+            window.focus(&self.focus);
+        }
+        let v = V::of(self.ctl.read(cx));
+        // the fan the dialog was for is gone (or never had a usable range)
+        if self.modal == Modal::Fan && self.dialog.as_ref().is_none_or(|d| v.snap.fans.get(d.fan).is_none_or(|f| !(f.max > f.min))) {
+            self.modal = Modal::None;
+            self.dialog = None;
+        }
+        let viewport = window.viewport_size();
+        let max_h = (viewport.height - gpui::px(64. * self.prefs.zoom)).min(gpui::px(640. * self.prefs.zoom));
+        let modal = match self.modal {
+            Modal::None => None,
+            Modal::Fan => self.fan_dialog(&v, &t, max_h, cx),
+            Modal::Prefs => Some(self.prefs_dialog(&v, &t, max_h, cx)),
+            Modal::About => Some(self.about(&t, cx)),
+        };
+        let popup = self.popup_layer(&t, viewport, cx);
+
+        div()
+            .key_context("MacSmartCooler")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &Cancel, _, cx| this.on_cancel(cx)))
+            .on_action(cx.listener(|this, _: &Confirm, _, cx| {
+                if this.modal == Modal::Fan && this.popup.is_none() {
+                    this.apply_dialog(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &About, _, cx| {
+                this.close_modal(cx);
+                this.modal = Modal::About;
+            }))
+            .on_action(cx.listener(|this, _: &Preferences, _, cx| {
+                this.close_modal(cx);
+                this.modal = Modal::Prefs;
+            }))
+            .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
+            .on_action(cx.listener(|_, _: &Minimize, window, _| window.minimize_window()))
+            .on_action(cx.listener(|this, _: &ThemeLight, _, cx| this.set_theme(ThemeMode::Light, cx)))
+            .on_action(cx.listener(|this, _: &ThemeDark, _, cx| this.set_theme(ThemeMode::Dark, cx)))
+            .on_action(cx.listener(|this, _: &ThemeAuto, _, cx| this.set_theme(ThemeMode::System, cx)))
+            .on_action(cx.listener(|this, _: &ZoomIn, window, cx| this.step_zoom(1, window, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, window, cx| this.step_zoom(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, window, cx| this.set_zoom(1., window, cx)))
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(linear_gradient(180., linear_color_stop(t.bg, 0.), linear_color_stop(t.bg_bottom, 1.)))
+            .text_color(t.text)
+            .font_family(".SystemUIFont")
+            .text_size(pt(13.5))
+            .line_height(relative(1.3))
+            .child(self.titlebar(&v, &t, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .gap(GAP)
+                            .pl(pt(20.))
+                            .pr(GAP)
+                            .pt(pt(6.))
+                            .pb(pt(20.))
+                            .child(self.hero(&v, &t))
+                            .child(self.mode_cards(&v, &t, cx))
+                            .child(self.fans(&v, &t, cx))
+                            .when_some(v.snap.error.clone(), |el, e| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .px(pt(14.))
+                                        .py(pt(9.))
+                                        .rounded(pt(10.))
+                                        .bg(t.danger.opacity(0.10))
+                                        .border_1()
+                                        .border_color(t.danger.opacity(0.24))
+                                        .text_size(pt(12.5))
+                                        .text_color(mix(t.danger, t.text, 0.35))
+                                        .child(e),
+                                )
+                            }),
+                    )
+                    .child(self.sensors(&v, &t)),
+            )
+            .when_some(modal, |el, card| {
+                // Like the original: dialogs float over the window without dimming it.
+                // Preferences hangs under the gear; the others are centred.
+                let prefs = self.modal == Modal::Prefs;
+                el.child(
+                    div()
+                        .id("backdrop")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .flex()
+                        .when(prefs, |el| el.justify_end().items_start().pt(pt(52.)).pr(pt(20.)))
+                        .when(!prefs, |el| el.items_center().justify_center().p(pt(32.)))
+                        .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))
+                        .child(card),
+                )
+            })
+            .when_some(popup, |el, layer| el.child(layer))
+    }
+}
+
+/// SF Pro Rounded, for numbers (loaded at startup in main.rs).
+const ROUNDED: &str = ".SF NS Rounded";
+
+fn num(size: f32) -> Div {
+    div().font_family(ROUNDED).text_size(pt(size))
+}
+
+/// The original card: flat, with a hairline edge (a soft shadow in light mode).
+fn panel(t: &Theme) -> Div {
+    div()
+        .rounded(CARD_RADIUS)
+        .bg(t.surface)
+        .border_1()
+        .border_color(t.border)
+        .when(!t.dark, |el| el.shadow(small_shadow(t)))
+}
+
+/// A button that opens a popup menu (Mac Cleaner's dropdown).
+fn dropdown(id: &'static str, label: String, t: &Theme) -> Stateful<Div> {
+    let hover = t.surface_2;
+    div()
+        .id(id)
+        .h(pt(32.))
+        .px(pt(10.))
+        .rounded(pt(8.))
+        .bg(t.surface)
+        .border_1()
+        .border_color(t.border_strong)
+        .flex()
+        .items_center()
+        .gap(pt(6.))
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .whitespace_nowrap()
+        .text_size(pt(12.5))
+        .child(div().flex_1().min_w_0().ellipsis().child(elided(label)))
+        .child(icon("chevron-down", 10., t.text_3))
+}
+
+/// A window size given in points at 100% zoom, scaled and kept inside the screen.
+pub fn window_size(points: (f32, f32), zoom: f32) -> Size<Pixels> {
+    let (max_w, max_h) = crate::native::screen_visible_size().unwrap_or((f32::MAX, f32::MAX));
+    gpui::size(gpui::px((points.0 * zoom).min(max_w)), gpui::px((points.1 * zoom).min(max_h)))
+}
+
+/* ================================================================
+   Snapshot walkthrough (debug builds only)
+   ================================================================ */
+
+#[cfg(debug_assertions)]
+impl Main {
+    /// Saves a PNG of each screen to `dir`, then quits. Never changes fans or saved settings:
+    /// `Ctl` is frozen (no commands, no prompts, no saving) and the states shown are display-only.
+    pub fn start_demo(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(wid) = crate::snapshot::window_number(window) else { return };
+        self.prefs.frozen = true;
+        let snap = move |name: &str| {
+            let path = format!("{dir}/{name}.png");
+            eprintln!("snapshot {path}: {}", crate::snapshot::save(wid, &path));
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let wait = move |ms| executor.timer(Duration::from_millis(ms));
+            // A covered window is not redrawn: bring it forward (and make it key, so the
+            // title-bar buttons are in colour) before every picture.
+            let shot = |this: &WeakEntity<Self>, cx: &mut gpui::AsyncWindowContext| {
+                this.update_in(cx, |_, window, cx| {
+                    crate::native::activate(window);
+                    cx.notify();
+                })
+                .ok();
+            };
+            let set = |this: &WeakEntity<Self>, cx: &mut gpui::AsyncWindowContext, f: Box<dyn FnOnce(&mut Self, &mut Context<Self>)>| {
+                this.update(cx, |this, cx| {
+                    f(this, cx);
+                    cx.notify();
+                })
+                .ok();
+            };
+            let demo = |this: &WeakEntity<Self>, cx: &mut gpui::AsyncWindowContext, d: crate::state::Demo| {
+                this.update(cx, |this, cx| this.ctl.update(cx, |c, cx| {
+                    c.demo = d;
+                    c.tick(cx);
+                }))
+                .ok();
+            };
+            // wait for real readings (or the sample) and two seconds of history
+            wait(2500).await;
+            shot(&this, cx);
+            wait(400).await;
+            snap("1-main");
+
+            set(&this, cx, Box::new(|this, cx| {
+                let c = this.ctl.read(cx);
+                if let Some(f) = c.snap.fans.first().cloned() {
+                    this.open_dialog(&f, &FanMode::Constant(3400.), cx);
+                }
+            }));
+            shot(&this, cx);
+            wait(500).await;
+            snap("2-fan-fixed");
+            set(&this, cx, Box::new(|this, _| {
+                if let Some(d) = &mut this.dialog {
+                    d.kind = DialogKind::Sensor;
+                }
+            }));
+            shot(&this, cx);
+            wait(500).await;
+            snap("3-fan-sensor");
+            set(&this, cx, Box::new(|this, cx| {
+                let v = V::of(this.ctl.read(cx));
+                let items = v
+                    .snap
+                    .sensors
+                    .iter()
+                    .filter(|r| r.named)
+                    .map(|r| PopItem { label: format!("{}  ({})", display_name(r), v.temp(r.value)).into(), checked: r.key == HOT_KEY, cmd: Cmd::Sensor(r.key.clone()) })
+                    .collect();
+                let z = this.prefs.zoom;
+                this.popup = Some(Popup { pos: point(gpui::px(420. * z), gpui::px(330. * z)), width: 300., items });
+            }));
+            shot(&this, cx);
+            wait(500).await;
+            snap("4-sensor-menu");
+
+            set(&this, cx, Box::new(|this, cx| {
+                this.close_modal(cx);
+                this.modal = Modal::Prefs;
+            }));
+            shot(&this, cx);
+            wait(500).await;
+            snap("5-preferences");
+            set(&this, cx, Box::new(|this, cx| {
+                this.close_modal(cx);
+                this.modal = Modal::About;
+            }));
+            shot(&this, cx);
+            wait(500).await;
+            snap("6-about");
+            set(&this, cx, Box::new(|this, cx| this.close_modal(cx)));
+
+            demo(&this, cx, crate::state::Demo { no_helper: true, error: true, preset: Some(Preset::Automatic), ..Default::default() });
+            shot(&this, cx);
+            wait(500).await;
+            snap("7-no-helper-error");
+            demo(&this, cx, crate::state::Demo { outdated: true, preset: Some(Preset::FullBlast), ..Default::default() });
+            shot(&this, cx);
+            wait(500).await;
+            snap("8-outdated-fullblast");
+            demo(&this, cx, crate::state::Demo { installing: true, preset: Some(Preset::Custom), ..Default::default() });
+            shot(&this, cx);
+            wait(500).await;
+            snap("9-installing-custom");
+            demo(&this, cx, crate::state::Demo::default());
+
+            this.update_in(cx, |this, window, _| window.resize(window_size(WINDOW_MIN, this.prefs.zoom))).ok();
+            wait(900).await;
+            shot(&this, cx);
+            wait(400).await;
+            snap("10-min-size");
+            this.update(cx, |_, cx| cx.quit()).ok();
+        })
+        .detach();
+    }
 }
