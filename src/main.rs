@@ -1,12 +1,23 @@
 mod auth;
+mod charts;
+mod elided;
 mod fans;
 mod helper;
 mod load;
+mod native;
+#[cfg(debug_assertions)]
+mod sample;
 mod sensors;
 mod settings;
 mod smc;
+#[cfg(debug_assertions)]
+mod snapshot;
+mod state;
+mod theme;
 mod tray;
 mod ui;
+mod ui_prefs;
+mod widgets;
 mod worker;
 
 use smc::{is_root, Smc};
@@ -202,26 +213,110 @@ fn cli_smart(rest: &[&str]) -> Result<(), String> {
     }
 }
 
-fn run_gui() -> Result<(), String> {
-    let title = "Mac Smart Cooler";
-    let icon = eframe::icon_data::from_png_bytes(ui::ICON_PNG).unwrap_or_default();
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title(title)
-            .with_icon(std::sync::Arc::new(icon))
-            .with_inner_size([1140.0, 640.0])
-            .with_min_inner_size([1000.0, 600.0])
-            .with_fullsize_content_view(true)
-            .with_titlebar_shown(false)
-            .with_title_shown(false),
-        ..Default::default()
+/// Icons are compiled into the binary.
+struct Assets;
+
+macro_rules! icons {
+    ($($name:literal),* $(,)?) => {
+        &[$((concat!("icons/", $name, ".svg"), include_bytes!(concat!("../assets/icons/", $name, ".svg")) as &[u8])),*]
     };
-    eframe::run_native(
-        title,
-        options,
-        Box::new(|cc| Ok(Box::new(ui::App::new(cc)))),
-    )
-    .map_err(|e| e.to_string())
+}
+
+const ICONS: &[(&str, &[u8])] = icons![
+    "alert", "arrow-down", "arrow-right", "arrow-up", "auto", "battery", "check-bold", "chevron-down", "chip", "close",
+    "fan", "gauge", "gear", "gpu", "laptop", "minus", "moon", "plus", "shield", "spinner", "sun", "thermometer", "trash",
+    "wind",
+];
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        Ok(ICONS.iter().find(|(name, _)| *name == path).map(|(_, data)| std::borrow::Cow::Borrowed(*data)))
+    }
+
+    fn list(&self, _path: &str) -> anyhow::Result<Vec<gpui::SharedString>> {
+        Ok(ICONS.iter().map(|(name, _)| gpui::SharedString::from(*name)).collect())
+    }
+}
+
+/// Runs `f` on the app-wide state (menu actions that work with or without the window).
+fn with_ctl(cx: &mut gpui::App, f: impl FnOnce(&mut state::Ctl, &mut gpui::Context<state::Ctl>)) {
+    if let Some(ctl) = cx.try_global::<state::Shared>().map(|s| s.0.clone()) {
+        ctl.update(cx, f);
+    }
+}
+
+fn run_gui() -> Result<(), String> {
+    use gpui::{Application, KeyBinding, Menu, MenuItem};
+    use state::Preset;
+    use ui::*;
+    // Debug builds only: the snapshot walkthrough (see `ui::Main::start_demo`).
+    let snapshots = cfg!(debug_assertions) && std::env::var_os("MACSMARTCOOLER_SNAPSHOT_DIR").is_some();
+    let sample = snapshots && std::env::var_os("MACSMARTCOOLER_SAMPLE").is_some();
+
+    let app = Application::new().with_assets(Assets);
+    // Clicking the Dock icon brings the window back after it was closed.
+    app.on_reopen(ui::open_window);
+    app.run(move |cx: &mut gpui::App| {
+        cx.bind_keys([
+            KeyBinding::new("escape", Cancel, None),
+            KeyBinding::new("enter", Confirm, None),
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-,", Preferences, None),
+            KeyBinding::new("cmd-1", ModeAuto, None),
+            KeyBinding::new("cmd-2", ModeSmart, None),
+            KeyBinding::new("cmd-3", ModeFull, None),
+            KeyBinding::new("cmd-w", CloseWindow, None),
+            KeyBinding::new("cmd-m", Minimize, None),
+            KeyBinding::new("cmd-=", ZoomIn, None),
+            KeyBinding::new("cmd-+", ZoomIn, None),
+            KeyBinding::new("cmd--", ZoomOut, None),
+            KeyBinding::new("cmd-0", ZoomReset, None),
+        ]);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &ModeAuto, cx| with_ctl(cx, |c, cx| c.choose_preset(Preset::Automatic, cx)));
+        cx.on_action(|_: &ModeSmart, cx| with_ctl(cx, |c, cx| c.choose_preset(Preset::Smart, cx)));
+        cx.on_action(|_: &ModeFull, cx| with_ctl(cx, |c, cx| c.choose_preset(Preset::FullBlast, cx)));
+        cx.set_menus(vec![
+            Menu {
+                name: "Mac Smart Cooler".into(),
+                items: vec![
+                    MenuItem::action("About Mac Smart Cooler", About),
+                    MenuItem::separator(),
+                    MenuItem::action("Preferences…", Preferences),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Mac Smart Cooler", Quit),
+                ],
+            },
+            Menu {
+                name: "Fan".into(),
+                items: vec![
+                    MenuItem::action("Apple Default", ModeAuto),
+                    MenuItem::action("Smart Cooling", ModeSmart),
+                    MenuItem::action("Full Blast", ModeFull),
+                ],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Light", ThemeLight),
+                    MenuItem::action("Dark", ThemeDark),
+                    MenuItem::action("Match System", ThemeAuto),
+                    MenuItem::separator(),
+                    MenuItem::action("Zoom In", ZoomIn),
+                    MenuItem::action("Zoom Out", ZoomOut),
+                    MenuItem::action("Actual Size", ZoomReset),
+                ],
+            },
+            Menu {
+                name: "Window".into(),
+                items: vec![MenuItem::action("Minimize", Minimize), MenuItem::action("Close Window", CloseWindow)],
+            },
+        ]);
+        // Closing the window does not quit: Mac Smart Cooler keeps running in the menu bar.
+        state::start(cx, snapshots, sample);
+        ui::open_window(cx);
+    });
+    Ok(())
 }
 
 /// Dry run of Smart Cooling on live sensors: prints what it would do, never touches the fans.

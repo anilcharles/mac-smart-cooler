@@ -222,6 +222,13 @@ launcher, hours of Blender) and check that Smart Cooling stays quiet or cools as
 | `src/helper.rs` | Background helper: install/remove, socket server, restore preset at boot |
 | `src/auth.rs` | macOS admin password prompt |
 | `src/settings.rs` | Saved preset and preferences |
-| `src/ui.rs` | The window (egui) |
+| `src/state.rs` | App-wide state: the worker, the menu bar item, settings, fan history |
+| `src/ui.rs` | The window (GPUI): sidebar, fans, sensors, dialogs |
+| `src/widgets.rs`, `src/theme.rs` | Building blocks and colours, shared with Mac Cleaner |
+| `src/charts.rs`, `src/elided.rs` | Ring gauge, rpm history, one-line text with "…" |
+| `src/ui_prefs.rs` | Appearance and zoom (window only, not shared with the helper) |
 | `src/tray.rs` | Menu bar icon and menu |
-| `src/main.rs` | Command-line entry points |
+| `src/main.rs` | Command-line entry points, app menus and shortcuts |
+
+Debug builds can capture every screen as PNGs from made-up data:
+`scripts/screenshots.sh [dir]` (light and dark, 85%, 100% and 150% zoom).

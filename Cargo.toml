@@ -5,9 +5,13 @@ edition = "2021"
 description = "Mac Smart Cooler: Mac fan control & temperature monitor"
 
 [dependencies]
-eframe = "0.29"
 ctrlc = { version = "3", features = ["termination"] }
 tray-icon = "0.26.1"
+gpui = "0.2.2"
+anyhow = "1"
+futures = "0.3"
+objc = "0.2"
+raw-window-handle = "0.6"
 
 [profile.release]
 opt-level = 3
