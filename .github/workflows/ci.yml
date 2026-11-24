@@ -1,0 +1,30 @@
+# Runs the tests on this Mac (self-hosted runner) for every pull request and every push to main.
+# The runner must be online (Settings > Actions > Runners); otherwise checks wait until it is.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to the same PR cancels its older, still-running check.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Clippy (report only)
+        # Warnings show up in the log but do not fail the check yet.
+        run: cargo clippy --locked --all-targets

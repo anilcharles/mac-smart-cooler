@@ -20,6 +20,10 @@ APP="dist/Mac Smart Cooler.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist/AppIcon.iconset dist/dmg
 cp target/release/macsmartcooler "$APP/Contents/MacOS/"
 cp packaging/Info.plist "$APP/Contents/"
+# the version comes from Cargo.toml (release-please bumps it there)
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
+plutil -replace CFBundleVersion -string "$VERSION" "$APP/Contents/Info.plist"
 
 [ -f assets/icon.png ] || python3 scripts/make-icon.py assets/icon.png
 cp assets/icon.png dist/icon.png
