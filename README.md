@@ -37,6 +37,11 @@ It downloads the latest release, checks it against its `.sha256`, copies the app
 Applications (replacing an older copy) and opens it. Your mode and the background helper are
 not touched: the helper keeps running and the new app picks it up.
 
+The `.sha256` file comes from the same release as the DMG. It catches a broken download, but
+it can't show who published the release. To check who signed the app, run
+`codesign -dv "/Applications/Mac Smart Cooler.app" 2>&1 | grep TeamIdentifier`. It should
+print the team ID you expect from this project's releases.
+
 **Or ask an AI assistant.** Paste this into Claude, ChatGPT or another assistant. One that can
 run commands on your Mac (such as Claude Code) can do the install for you. A chat-only one
 walks you through it step by step.
@@ -237,6 +242,24 @@ and "Full speed at", default 88 °C). Case air and palm rest thresholds are fixe
     then runs that copy. Builds without a signing team skip the signature check.
   - The app asks for your password on its own only when the helper answers with a different
     version. A helper that isn't answering shows a **Repair helper** button instead.
+  - **Known open items.** A source-only security audit (November 2026) found no confirmed
+    vulnerabilities. It did leave these leads open; each needs a test on a spare Mac to
+    confirm or rule out:
+    - *Helper install, staging file.* While installing, root copies the helper to
+      `/Library/PrivilegedHelperTools/local.macsmartcooler.helper.new`. That copy keeps the
+      app's owner (you) until it is changed to root a moment later. A program running as you
+      could add a write permission (ACL) to the file in that moment, and the permission would
+      stay on the installed root helper. This applies to signed builds too.
+    - *Helper install, unsigned builds.* With no signing team (plain `cargo build`, or
+      `make-dmg.sh` that only prints *no signing team*), root runs whatever is in the app
+      bundle when you approve the prompt. Ship only builds that printed `Team ID: …`.
+    - *Helper install, launchd plist.* On a first install the plist is created with the
+      calling app's umask and only then set to `0644`.
+    - *Window run with `sudo`.* Appearance and zoom are saved to `ui.txt` under `$HOME`,
+      following symlinks. If `sudo` keeps your `HOME`, root writes there. Use the background
+      helper rather than running the window with `sudo`.
+    - *Helper socket.* The helper sets the socket's mode by path in `/var/run`, which the
+      `daemon` group can write. This matters only if a non-root process runs with that group.
 - The helper's version is a hash of the fan-logic source files. When an app update changes
   that logic, the app notices the installed helper is outdated and asks to replace it.
 - **If the helper crashes or is killed:** when launchd restarts it, it first hands any fan
@@ -270,6 +293,9 @@ The app's binary also works from the terminal (`/Applications/Mac Smart Cooler.a
     macsmartcooler uninstall-helper  remove it
 
 `watch` is the easiest way to see why the fans are (or aren't) running.
+
+To control the fans from the window, install the background helper rather than opening the
+window with `sudo`. See *Known open items* above.
 
 ## Build
 
