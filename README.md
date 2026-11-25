@@ -17,14 +17,15 @@ The screenshots use made-up readings (`scripts/screenshots.sh docs`).
 
 Needs macOS 11 or later. Release downloads are for Apple silicon (M1 or later).
 
-**The quick way.** The repository is private, so downloads go through the GitHub command-line tool
-`gh`, signed in to an account that can see it (`brew install gh`, then `gh auth login`). Open
-**Terminal** (press ⌘Space, type `Terminal`, press Return), paste this and press Return:
+**The quick way.** Open **Terminal** (press ⌘Space, type `Terminal`, press Return), paste this
+and press Return:
 
 ```sh
-/bin/sh -c 'set -e; cd "$(mktemp -d)"; R=anilcharles/mac-smart-cooler
-gh release download --repo "$R" --pattern "Mac-Smart-Cooler-*-arm64.dmg*"
-DMG=$(ls Mac-Smart-Cooler-*-arm64.dmg); shasum -a 256 -c "$DMG.sha256"
+/bin/sh -c 'set -e; cd "$(mktemp -d)"; R=https://github.com/anilcharles/mac-smart-cooler/releases
+TAG=$(curl -fsSLo /dev/null -w "%{url_effective}" "$R/latest"); TAG=${TAG##*/}
+DMG=Mac-Smart-Cooler-${TAG#v}-arm64.dmg
+curl -fL --progress-bar -O "$R/download/$TAG/$DMG" -O "$R/download/$TAG/$DMG.sha256"
+shasum -a 256 -c "$DMG.sha256"
 hdiutil attach -nobrowse -quiet -mountpoint mnt "$DMG"
 osascript -e "quit app \"Mac Smart Cooler\"" 2>/dev/null || true
 rm -rf "/Applications/Mac Smart Cooler.app"; ditto "mnt/Mac Smart Cooler.app" "/Applications/Mac Smart Cooler.app"
@@ -46,10 +47,9 @@ walks you through it step by step.
 ```text
 Help me install the Mac app "Mac Smart Cooler" from its GitHub releases:
 https://github.com/anilcharles/mac-smart-cooler/releases/latest
-The repository is private, so use the GitHub CLI (gh), signed in to my account.
 
-1. Download only from that repository:
-   gh release download --repo anilcharles/mac-smart-cooler --pattern "Mac-Smart-Cooler-*-arm64.dmg*"
+1. Download only from that repository's latest release: Mac-Smart-Cooler-<version>-arm64.dmg
+   and Mac-Smart-Cooler-<version>-arm64.dmg.sha256 (curl works; no GitHub account needed).
 2. Check the download with: shasum -a 256 -c Mac-Smart-Cooler-<version>-arm64.dmg.sha256
    Stop and tell me if the check fails.
 3. Quit Mac Smart Cooler if it is running, then copy "Mac Smart Cooler.app" from the DMG into
