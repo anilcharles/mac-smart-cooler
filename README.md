@@ -123,3 +123,7 @@ cargo test --release      # logic tests, incl. fan takeover on simulated Macs
 
 The command line, the release runner setup and the source layout are in
 **[Development](docs/development.md)**.
+
+## Credits
+
+Created with [Claude](https://claude.com/claude-code).
