@@ -25,6 +25,7 @@ if [ "$1" = docs ]; then
   cp "$TMP/light/1-main.png"       "$OUT/main-light.png"
   cp "$TMP/dark/3-fan-sensor.png"  "$OUT/custom-fan.png"
   cp "$TMP/dark/5-preferences.png" "$OUT/preferences.png"
+  cp "$TMP/dark/6b-processes.png"  "$OUT/processes.png"
   # The captures are Retina-sized (2 pixels per point): bring them to the window's size in
   # points, 1140 x 640, to keep the repository small.
   for f in "$OUT"/*.png; do

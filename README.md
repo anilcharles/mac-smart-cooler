@@ -100,6 +100,8 @@ tested so far on a 16-inch M1 Max), is in **[Modes and Smart Cooling](docs/smart
 
 ## Why are the fans on?
 
+![The Processes tab: what was busy when the fans came on, and the busiest processes now](docs/screenshots/processes.png)
+
 The **Processes** tab (next to **Sensors**, or click the CPU or GPU meter) lists what is using
 the CPU and GPU, averaged over the last 30 seconds, including macOS's own services such as
 Spotlight (`mds_stores`) or WindowServer. Hover a row for what the process is. Above the
