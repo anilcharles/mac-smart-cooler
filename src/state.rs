@@ -5,6 +5,7 @@
 //! The logic is the egui front-end's, moved here unchanged.
 
 use crate::helper;
+use crate::procs;
 use crate::sensors::HOT_KEY;
 use crate::settings::{self, Settings};
 use crate::smc::is_root;
@@ -108,6 +109,11 @@ pub struct Ctl {
     /// last ~2 minutes of each fan's rpm, one sample per second
     pub hist: Vec<VecDeque<f32>>,
     hist_at: Option<Instant>,
+    /// which processes are busy (sampled on its own thread; None with made-up data)
+    sampler: Option<procs::Sampler>,
+    pub procs: procs::Latest,
+    /// every time the fans came on since launch, with what was busy just before
+    pub spins: procs::SpinWatch,
     /// Snapshot walkthrough: no menu bar item, no password prompts, no fan commands, no saving.
     pub frozen: bool,
     /// Showing made-up data (`sample.rs`) instead of this Mac's.
@@ -160,6 +166,9 @@ impl Ctl {
             rpm: Vec::new(),
             hist: Vec::new(),
             hist_at: None,
+            sampler: (!sample).then(procs::Sampler::spawn),
+            procs: procs::Latest::default(),
+            spins: procs::SpinWatch::default(),
             frozen,
             sample,
             demo: Demo::default(),
@@ -185,6 +194,13 @@ impl Ctl {
 
     pub fn hot(&self) -> Option<f64> {
         self.snap.sensors.iter().find(|r| r.key == HOT_KEY).map(|r| r.value)
+    }
+
+    /// The process table is on screen: sample it every couple of seconds for a while.
+    pub fn watch_procs(&self) {
+        if let Some(s) = &self.sampler {
+            s.watch();
+        }
     }
 
     pub fn installing(&self) -> bool {
@@ -413,6 +429,22 @@ impl Ctl {
                     h.pop_front();
                 }
             }
+        }
+
+        if let Some(s) = &self.sampler {
+            self.procs = s.latest();
+        }
+        #[cfg(debug_assertions)]
+        if self.sample {
+            self.procs = crate::sample::procs();
+            if self.spins.events.is_empty() {
+                self.spins.events = crate::sample::spins();
+            }
+        }
+        if self.snap.ready && !self.sample {
+            let fans: Vec<(f64, f64)> = self.snap.fans.iter().map(|f| (f.actual, f.min)).collect();
+            let minute = &self.procs.minute;
+            self.spins.update(Instant::now(), std::time::SystemTime::now(), &fans, self.snap.activity.smart.as_deref(), || minute.clone());
         }
 
         let mut preset = Self::preset_of(&self.snap);

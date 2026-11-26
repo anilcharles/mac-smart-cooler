@@ -2,6 +2,7 @@
 //! Nothing here reads or touches the hardware.
 
 use crate::fans::FanInfo;
+use crate::procs::{FanEvent, Latest, Owner, Usage};
 use crate::sensors::{Reading, CPU_AVG_KEY, GPU_AVG_KEY, HOT_KEY};
 use crate::worker::{Activity, FanMode, Snapshot};
 use std::collections::VecDeque;
@@ -71,4 +72,62 @@ pub fn history(fan: usize, now: f32) -> VecDeque<f32> {
             if ramp <= 0. { 0. } else { 1200. + (now - 1200.) * ramp + wobble }
         })
         .collect()
+}
+
+fn usage(name: &str, pids: &[i32], cpu: f64, gpu: f64, owner: Owner) -> Usage {
+    Usage { name: name.into(), pids: pids.to_vec(), cpu, gpu, owner }
+}
+
+/// A made-up process table: a render in Blender, with the usual company.
+pub fn procs() -> Latest {
+    let table = vec![
+        usage("Blender", &[4120], 3.82, 0.41, Owner::You),
+        usage("WindowServer", &[194], 0.31, 0.12, Owner::System),
+        usage("mds_stores", &[269], 0.22, 0., Owner::System),
+        usage("Safari Web Content", &[2210, 2214, 2290], 0.14, 0.02, Owner::You),
+        usage("kernel_task", &[0], 0.09, 0., Owner::System),
+        usage("Code Helper (Renderer)", &[1295, 1301], 0.06, 0.004, Owner::You),
+        usage("Music", &[880], 0.031, 0.001, Owner::You),
+        usage("backupd", &[402], 0.027, 0., Owner::System),
+        usage("Finder", &[641], 0.012, 0., Owner::You),
+        usage("Mac Smart Cooler", &[5011], 0.008, 0.001, Owner::You),
+        usage("bluetoothd", &[171], 0.006, 0., Owner::System),
+        usage("coreaudiod", &[226], 0.004, 0., Owner::System),
+    ];
+    Latest { minute: table.clone(), table, gpu_known: true, span: 30., error: None }
+}
+
+/// Two made-up times the fans came on.
+pub fn spins() -> VecDeque<FanEvent> {
+    let now = std::time::Instant::now();
+    let wall = std::time::SystemTime::now();
+    let ago = |m: u64| std::time::Duration::from_secs(m * 60);
+    VecDeque::from(vec![
+        FanEvent {
+            wall: wall - ago(6),
+            started: now - ago(6),
+            lasted: None,
+            peak_rpm: 2580.,
+            why: Some("back of the case is warm".into()),
+            at_launch: false,
+            culprits: vec![
+                usage("Blender", &[4120], 3.64, 0.38, Owner::You),
+                usage("WindowServer", &[194], 0.28, 0.10, Owner::System),
+                usage("mds_stores", &[269], 0.19, 0., Owner::System),
+            ],
+        },
+        FanEvent {
+            wall: wall - ago(52),
+            started: now - ago(52),
+            lasted: Some(ago(3)),
+            peak_rpm: 1650.,
+            why: None,
+            at_launch: false,
+            culprits: vec![
+                usage("mds_stores", &[269], 1.21, 0., Owner::System),
+                usage("mdworker_shared", &[3301, 3302, 3307], 0.64, 0., Owner::System),
+                usage("Safari Web Content", &[2210], 0.12, 0.03, Owner::You),
+            ],
+        },
+    ])
 }
