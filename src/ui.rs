@@ -1,11 +1,12 @@
-//! The window. Laid out like Mac Cleaner: a sidebar (status card, modes, this Mac) and a
-//! scrolling main column (current mode, live load, fans, sensors), with dialogs on a dimmed
-//! backdrop. Everything it shows comes from `state::Ctl`; every choice goes back to it.
+//! The window. A main column (current mode, live load, modes, fans) and a sidebar on the
+//! right that shows either the sensors or the busiest processes (and what was busy each time
+//! the fans came on), with dialogs floating over it. Everything it shows comes from `state::Ctl`; every choice goes back to it.
 
 use crate::charts::{ring_gauge, sparkline};
 use crate::elided::elided;
 use crate::fans::FanInfo;
 use crate::helper;
+use crate::procs::{self, FanEvent, Owner, Sort, Usage};
 use crate::sensors::{Reading, HOT_KEY};
 use crate::settings::Settings;
 use crate::state::{thousands, Ctl, Preset, Shared, HIST_SECS};
@@ -104,6 +105,8 @@ struct V {
     hist: Vec<VecDeque<f32>>,
     model: String,
     model_id: String,
+    procs: procs::Latest,
+    spins: Vec<FanEvent>,
 }
 
 impl V {
@@ -118,6 +121,8 @@ impl V {
             hist: c.hist.clone(),
             model: c.model.clone(),
             model_id: c.model_id.clone(),
+            procs: c.procs.clone(),
+            spins: c.spins.events.iter().cloned().collect(),
         }
     }
 
@@ -151,6 +156,10 @@ fn display_name(r: &Reading) -> &str {
     match r.key.as_str() {
         "TaLP" => "Case Air Left",
         "TaRF" => "Case Air Right",
+        // The keys don't name a side. Resting a palm on the left palm rest warmed Ts0P and
+        // left Ts1P unchanged (16-inch M1 Max; one test, at whole-degree resolution).
+        "Ts0P" => "Palm Rest Left",
+        "Ts1P" => "Palm Rest Right",
         "TW0P" => "Wi-Fi Module",
         HOT_KEY => "Hottest Core",
         _ => &r.name,
@@ -232,6 +241,9 @@ pub struct Main {
     /// a stepper button held down (repeats), with a counter so an old repeat loop stops
     hold: Option<(StepId, i32, u64)>,
     hold_gen: u64,
+    /// process table: the column it is sorted by, and every fan spin-up listed (not just the latest)
+    sort: Sort,
+    all_spins: bool,
     app_icon: Arc<gpui::Image>,
     _subs: Vec<Subscription>,
 }
@@ -257,6 +269,8 @@ impl Main {
             tracks: HashMap::new(),
             hold: None,
             hold_gen: 0,
+            sort: Sort::Cpu,
+            all_spins: false,
             app_icon: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, ICON_PNG.to_vec())),
             _subs: vec![appearance, observe],
         }
@@ -270,6 +284,15 @@ impl Main {
         self.prefs.theme = mode;
         self.prefs.save();
         cx.notify();
+    }
+
+    /// The sidebar's tab: sensors or processes.
+    fn show_processes(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.prefs.processes != on {
+            self.prefs.processes = on;
+            self.prefs.save();
+            cx.notify();
+        }
     }
 
     /// Makes the whole interface bigger or smaller. Every size is in rems, so changing the
@@ -556,7 +579,7 @@ impl Main {
        ================================================================ */
 
     /// Big status card: hottest-core ring gauge, what the current mode is doing, live load.
-    fn hero(&self, v: &V, t: &Theme) -> Div {
+    fn hero(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
         let a = &v.snap.activity;
         let hot = v.hot();
         let arrow = if a.trend > 0.5 {
@@ -630,8 +653,16 @@ impl Main {
         if let Some(b) = a.body {
             items.push(("CASE AIR", v.temp(b), ((b - 28.0) / 36.0) as f32, t.temp(b + 20.0)));
         }
-        let meters = items.into_iter().map(|(label, value, frac, col)| {
+        let meters = items.into_iter().enumerate().map(|(i, (label, value, frac, col))| {
+            // CPU and GPU open the process table: what is behind the number
+            let load = matches!(label, "CPU" | "GPU");
             div()
+                .id(("meter", i))
+                .when(load, |el| {
+                    el.cursor_pointer()
+                        .tooltip(tip(format!("See which processes are using the {label}"), t))
+                        .on_click(cx.listener(|this, _, _, cx| this.show_processes(true, cx)))
+                })
                 .flex_1()
                 .min_w(pt(60.))
                 .child(div().text_size(pt(10.)).text_color(t.text_3).child(label))
@@ -849,6 +880,25 @@ impl Main {
        Sensors (right column)
        ================================================================ */
 
+    /// The right-hand column: a Sensors | Processes switch over the chosen list.
+    fn sidebar(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
+        let on = self.prefs.processes;
+        let tabs = segmented(t)
+            .flex_none()
+            .child(segment("side-sensors", "Sensors", !on, t).on_click(cx.listener(|this, _, _, cx| this.show_processes(false, cx))))
+            .child(segment("side-procs", "Processes", on, t).on_click(cx.listener(|this, _, _, cx| this.show_processes(true, cx))));
+        div().w(SENSORS_W).flex_none().h_full().pr(pt(20.)).pt(pt(6.)).pb(pt(20.)).child(
+            panel(t)
+                .size_full()
+                .p(pt(18.))
+                .pt(pt(14.))
+                .flex()
+                .flex_col()
+                .child(tabs)
+                .map(|el| if on { el.child(self.processes(v, t, cx)) } else { el.child(self.sensors(v, t)) }),
+        )
+    }
+
     fn sensors(&self, v: &V, t: &Theme) -> Div {
         let shown = v.snap.sensors.iter().filter(|r| r.named || v.s.show_unnamed).count();
         let mut list = div().id("sensor-list").flex_1().min_h_0().overflow_y_scroll().flex().flex_col();
@@ -885,25 +935,153 @@ impl Main {
                 );
             }
         }
-        div().w(SENSORS_W).flex_none().h_full().pr(pt(20.)).pt(pt(6.)).pb(pt(20.)).child(
-            panel(t)
-                .size_full()
-                .p(pt(18.))
-                .flex()
-                .flex_col()
-                .child(
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .when(v.snap.ready, |el| {
+                el.child(div().mt(pt(10.)).text_size(pt(11.5)).text_color(t.text_3).child(format!("{shown} temperature sensors")))
+            })
+            .when(!v.snap.ready, |el| {
+                el.child(div().mt(pt(12.)).flex().items_center().gap(pt(8.)).child(spinner("sensors-loading", 14., t)).child(div().text_color(t.text_2).child("Reading sensors…")))
+            })
+            .child(list)
+    }
+
+    /// What is using the Mac right now, and what was busy each time the fans came on.
+    fn processes(&self, v: &V, t: &Theme, cx: &mut Context<Self>) -> Div {
+        let p = &v.procs;
+        let gpu = p.gpu_known;
+        let mut list = div().id("process-list").flex_1().min_h_0().overflow_y_scroll().flex().flex_col();
+
+        // ---- why the fans came on
+        list = list.child(section_title("Why the fans came on", t));
+        if v.spins.is_empty() {
+            list = list.child(
+                div()
+                    .mt(pt(4.))
+                    .mb(pt(4.))
+                    .text_size(pt(12.))
+                    .text_color(t.text_2)
+                    .child("The fans haven't come on since Mac Smart Cooler started. When they do, what was busy in the minute before is listed here."),
+            );
+        } else {
+            let shown = if self.all_spins { v.spins.len() } else { 1 };
+            for (i, e) in v.spins.iter().take(shown).enumerate() {
+                list = list.child(spin_card(i, e, gpu, t));
+            }
+            if v.spins.len() > 1 {
+                let all = self.all_spins;
+                let label = if all { "Show only the latest".to_string() } else { format!("Show {} earlier", v.spins.len() - 1) };
+                list = list.child(
                     div()
+                        .id("all-spins")
+                        .flex_none()
+                        .mt(pt(-2.))
+                        .mb(pt(4.))
+                        .text_size(pt(12.))
+                        .text_color(t.accent)
+                        .cursor_pointer()
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.all_spins = !all;
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+
+        // ---- right now
+        let window = if p.span >= 1.0 && p.span < procs::TABLE_SECS - 1.0 { format!("last {:.0} s", p.span) } else { "last 30 s".into() };
+        list = list.child(section_title(&format!("Right now · {window}"), t));
+        let sort = self.sort;
+        let header = |id: &'static str, label: &'static str, by: Sort, w: f32, hint: &'static str, cx: &mut Context<Self>| {
+            let on = sort == by;
+            div()
+                .id(id)
+                .w(pt(w))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(pt(3.))
+                .cursor_pointer()
+                .text_color(if on { t.text_2 } else { t.text_3 })
+                .hover(|s| s.text_color(t.text))
+                .tooltip(tip(hint, t))
+                .when(on, |el| el.child(icon("arrow-down", 8., t.text_2)))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sort = by;
+                    cx.notify();
+                }))
+        };
+        list = list.child(
+            div()
+                .flex_none()
+                .h(pt(22.))
+                .pl(pt(17.))
+                .pr(pt(6.))
+                .flex()
+                .items_center()
+                .gap(pt(8.))
+                .text_size(pt(10.5))
+                .child(div().flex_1().text_color(t.text_3).child("PROCESS"))
+                .child(header("sort-cpu", "CPU", Sort::Cpu, 52., "Averaged over the last 30 s. 100% is one core fully busy, as in Activity Monitor.", cx))
+                .when(gpu, |el| el.child(header("sort-gpu", "GPU", Sort::Gpu, 44., "Share of the graphics processor, averaged over the last 30 s.", cx))),
+        );
+
+        if let Some(err) = &p.error {
+            list = list.child(div().mt(pt(6.)).text_color(t.danger).child(format!("Can't read processes: {err}")));
+        } else if p.span <= 0.0 {
+            list = list.child(
+                div().mt(pt(8.)).flex().items_center().gap(pt(8.)).child(spinner("procs-loading", 14., t)).child(div().text_color(t.text_2).child("Measuring…")),
+            );
+        } else {
+            let mut rows: Vec<Usage> = p.table.clone();
+            procs::sort_rows(&mut rows, sort);
+            let n = rows.len();
+            for (i, r) in rows.iter().enumerate() {
+                let level = match sort {
+                    Sort::Cpu => r.cpu.min(1.0),
+                    Sort::Gpu => r.gpu,
+                };
+                list = list.child(
+                    div()
+                        .id(("proc", i))
+                        .relative()
+                        .flex_none()
+                        .h(pt(28.))
+                        .pl(pt(1.))
+                        .pr(pt(6.))
+                        .rounded(pt(6.))
                         .flex()
                         .items_center()
-                        .child(div().text_size(pt(16.)).child("Sensors"))
-                        .child(div().flex_1())
-                        .when(v.snap.ready, |el| el.child(num(12.).text_color(t.text_3).child(shown.to_string()))),
-                )
-                .when(!v.snap.ready, |el| {
-                    el.child(div().mt(pt(8.)).flex().items_center().gap(pt(8.)).child(spinner("sensors-loading", 14., t)).child(div().text_color(t.text_2).child("Reading sensors…")))
-                })
-                .child(list),
-        )
+                        .gap(pt(10.))
+                        .hover(|s| s.bg(t.hover))
+                        .tooltip(tip(process_tip(r), t))
+                        .child(div().size(pt(6.)).flex_none().rounded_full().bg(t.load(level)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap(pt(5.))
+                                .child(div().flex_1().min_w_0().ellipsis().text_color(mix(t.text_2, t.text, 0.6)).child(elided(r.name.clone())))
+                                .when(r.pids.len() > 1, |el| el.child(div().flex_none().text_size(pt(11.)).text_color(t.text_3).child(format!("×{}", r.pids.len())))),
+                        )
+                        .child(num(13.).w(pt(52.)).flex_none().flex().justify_end().text_color(if r.cpu >= 0.5 { t.load(r.cpu.min(1.0)) } else { t.text }).child(procs::cpu_text(r.cpu)))
+                        .when(gpu, |el| el.child(num(13.).w(pt(44.)).flex_none().flex().justify_end().text_color(if r.gpu >= 0.25 { t.load(r.gpu) } else { t.text_2 }).child(procs::gpu_text(r.gpu))))
+                        .when(i + 1 < n, |el| el.child(div().absolute().bottom_0().left(pt(16.)).right_0().h(pt(1.)).bg(t.border.opacity(0.6)))),
+                );
+            }
+            if n == 0 {
+                list = list.child(div().mt(pt(6.)).text_color(t.text_2).child("Nothing is busy."));
+            }
+        }
+        div().flex_1().min_h_0().flex().flex_col().child(list)
     }
 
     /* ================================================================
@@ -1311,6 +1489,9 @@ impl Render for Main {
             window.focus(&self.focus);
         }
         let v = V::of(self.ctl.read(cx));
+        if self.prefs.processes {
+            self.ctl.read(cx).watch_procs();
+        }
         // the fan the dialog was for is gone (or never had a usable range)
         if self.modal == Modal::Fan && self.dialog.as_ref().is_none_or(|d| v.snap.fans.get(d.fan).is_none_or(|f| !(f.max > f.min))) {
             self.modal = Modal::None;
@@ -1378,7 +1559,7 @@ impl Render for Main {
                             .pr(GAP)
                             .pt(pt(6.))
                             .pb(pt(20.))
-                            .child(self.hero(&v, &t))
+                            .child(self.hero(&v, &t, cx))
                             .child(self.mode_cards(&v, &t, cx))
                             .child(self.fans(&v, &t, cx))
                             .when_some(v.snap.error.clone(), |el, e| {
@@ -1397,7 +1578,7 @@ impl Render for Main {
                                 )
                             }),
                     )
-                    .child(self.sensors(&v, &t)),
+                    .child(self.sidebar(&v, &t, cx)),
             )
             .when_some(modal, |el, card| {
                 // Like the original: dialogs float over the window without dimming it.
@@ -1435,6 +1616,98 @@ fn panel(t: &Theme) -> Div {
         .border_1()
         .border_color(t.border)
         .when(!t.dark, |el| el.shadow(small_shadow(t)))
+}
+
+/// A small upper-case heading inside a sidebar list.
+fn section_title(text: &str, t: &Theme) -> Div {
+    div().flex_none().mt(pt(14.)).mb(pt(4.)).text_size(pt(10.5)).text_color(t.text_3).child(text.to_uppercase())
+}
+
+/// "Blender · pid 4120 · your account", or the pids of every process with that name.
+fn process_tip(r: &Usage) -> String {
+    let pids = match r.pids.as_slice() {
+        [one] => format!("pid {one}"),
+        many => {
+            let list: Vec<String> = many.iter().take(8).map(|p| p.to_string()).collect();
+            let more = if many.len() > 8 { format!(" and {} more", many.len() - 8) } else { String::new() };
+            format!("{} processes: pids {}{more}", many.len(), list.join(", "))
+        }
+    };
+    let owner = match r.owner {
+        Owner::You => "runs as you",
+        Owner::System => "a macOS system process",
+        Owner::OtherUser => "runs as another account",
+    };
+    match procs::explain(&r.name) {
+        Some(what) => format!("{}\n{what}.\n{pids} · {owner}", r.name),
+        None => format!("{}\n{pids} · {owner}", r.name),
+    }
+}
+
+/// One time the fans came on: when, how fast, for how long, and the busiest processes.
+fn spin_card(i: usize, e: &FanEvent, gpu: bool, t: &Theme) -> Stateful<Div> {
+    let when = std::time::SystemTime::now().duration_since(e.wall).unwrap_or_default();
+    let status = match e.lasted {
+        None => "still on".to_string(),
+        Some(d) => format!("on for {}", procs::duration_text(d)),
+    };
+    let title = if e.at_launch {
+        match e.lasted {
+            None => "On since the app started".to_string(),
+            Some(d) => format!("On at launch, for {}", procs::duration_text(d)),
+        }
+    } else {
+        format!("{} · {status}", capitalize(&procs::ago(when)))
+    };
+    let culprits = e.culprits.iter().enumerate().map(|(j, u)| {
+        let mut load = format!("{} CPU", procs::cpu_text(u.cpu));
+        if gpu && u.gpu >= 0.05 {
+            load += &format!(" · {} GPU", procs::gpu_text(u.gpu));
+        }
+        div()
+            .id(("culprit", i * 10 + j))
+            .flex()
+            .items_center()
+            .gap(pt(8.))
+            .h(pt(20.))
+            .tooltip(tip(process_tip(u), t))
+            .child(div().flex_1().min_w_0().ellipsis().child(elided(u.name.clone())))
+            .child(num(12.).flex_none().text_color(t.text_2).child(load))
+    });
+    div()
+        .id(("spin", i))
+        .flex_none()
+        .mb(pt(8.))
+        .px(pt(12.))
+        .py(pt(10.))
+        .rounded(pt(10.))
+        .bg(t.surface_2)
+        .border_1()
+        .border_color(t.border)
+        .flex()
+        .flex_col()
+        .gap(pt(2.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(pt(6.))
+                .child(icon("fan", 13., if e.lasted.is_none() { t.cyan } else { t.text_3 }))
+                .child(div().flex_1().min_w_0().ellipsis().text_size(pt(13.)).child(elided(title)))
+                .child(num(11.5).flex_none().text_color(t.text_3).child(format!("{} rpm", thousands(e.peak_rpm)))),
+        )
+        .when_some(e.why.clone(), |el, why| el.child(div().text_size(pt(11.5)).text_color(t.text_2).child(format!("Smart Cooling: {why}"))))
+        .child(div().mt(pt(4.)).text_size(pt(10.)).text_color(t.text_3).child(if e.at_launch { "BUSIEST SINCE THE APP STARTED" } else { "BUSIEST IN THE MINUTE BEFORE" }))
+        .when(e.culprits.is_empty(), |el| {
+            let note = if e.at_launch { "Measuring…" } else { "Nothing stood out (the Mac was mostly idle)." };
+            el.child(div().text_size(pt(12.)).text_color(t.text_2).child(note))
+        })
+        .child(div().flex().flex_col().text_size(pt(12.5)).children(culprits))
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 /// A button that opens a popup menu (Mac Cleaner's dropdown).
@@ -1476,6 +1749,7 @@ impl Main {
     pub fn start_demo(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(wid) = crate::snapshot::window_number(window) else { return };
         self.prefs.frozen = true;
+        self.prefs.processes = false; // the walkthrough shows the sensors first, whatever was saved
         let snap = move |name: &str| {
             let path = format!("{dir}/{name}.png");
             eprintln!("snapshot {path}: {}", crate::snapshot::save(wid, &path));
@@ -1560,6 +1834,11 @@ impl Main {
             wait(500).await;
             snap("6-about");
             set(&this, cx, Box::new(|this, cx| this.close_modal(cx)));
+            set(&this, cx, Box::new(|this, _| this.prefs.processes = true));
+            shot(&this, cx);
+            wait(500).await;
+            snap("6b-processes");
+            set(&this, cx, Box::new(|this, _| this.prefs.processes = false));
 
             demo(&this, cx, crate::state::Demo { no_helper: true, error: true, preset: Some(Preset::Automatic), ..Default::default() });
             shot(&this, cx);

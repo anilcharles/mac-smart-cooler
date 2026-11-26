@@ -11,6 +11,11 @@
 ```
 
 - **Reading needs no privileges**, so the app reads sensors and fans itself.
+- **Processes tab.** The app runs `/bin/ps` (installed setuid root by macOS, so it lists every
+  account's processes) for each process's CPU time, and reads per-process GPU time from the
+  GPU's IORegistry entries. It samples every 10 s, or every 2 s while the tab is on screen
+  (about 2% of one core while it is), and works out usage from the change between samples.
+  The helper is not involved and does not change.
 - **Writing fan speeds needs root.** "Enable fan control" installs a launchd daemon
   (`local.macsmartcooler.helper`) that runs the same binary as root. The app sends it commands
   over `/var/run/macsmartcooler.sock`, so you only enter a password once.

@@ -98,6 +98,14 @@ Each fan can also run its own mode, including a fixed speed or a ramp that follo
 How Smart Cooling decides, and which Macs are supported (Apple silicon M1 to M6 and Intel;
 tested so far on a 16-inch M1 Max), is in **[Modes and Smart Cooling](docs/smart-cooling.md)**.
 
+## Why are the fans on?
+
+The **Processes** tab (next to **Sensors**, or click the CPU or GPU meter) lists what is using
+the CPU and GPU, averaged over the last 30 seconds, including macOS's own services such as
+Spotlight (`mds_stores`) or WindowServer. Hover a row for what the process is. Above the
+table, **Why the fans came on** keeps each time the fans spun up since the app started, with
+the processes that were busiest in the minute before. From the terminal: `macsmartcooler top`.
+
 ## Security
 
 Reading sensors needs no privileges. Writing fan speeds needs root, so **Enable fan control**

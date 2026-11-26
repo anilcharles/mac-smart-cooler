@@ -33,13 +33,15 @@ The app's binary also works from the terminal (`/Applications/Mac Smart Cooler.a
     macsmartcooler                   open the window
     macsmartcooler list              print fans and every temperature sensor
     macsmartcooler watch             print Smart Cooling's decision every second (changes nothing)
+    macsmartcooler top               print the busiest processes (CPU and GPU, last 30 s) every 2 s
     sudo macsmartcooler set 0 3000   fan 0 to a fixed 3000 rpm
     sudo macsmartcooler auto [fan]   give one fan (or all) back to macOS
     sudo macsmartcooler smart        run Smart Cooling in the terminal until Ctrl-C
     macsmartcooler install-helper    install the background helper
     macsmartcooler uninstall-helper  remove it
 
-`watch` is the easiest way to see why the fans are (or aren't) running.
+`watch` is the easiest way to see why the fans are (or aren't) running, and `top` shows which
+processes are making the heat.
 
 To control the fans from the window, install the background helper rather than opening the
 window with `sudo`. See *Known open items* in [How it works](how-it-works.md).
@@ -52,6 +54,7 @@ window with `sudo`. See *Known open items* in [How it works](how-it-works.md).
 | `src/fans.rs` | Fan info and switching fans between manual and automatic |
 | `src/sensors.rs` | Finds temperature keys and gives them readable names |
 | `src/load.rs` | CPU and GPU utilisation |
+| `src/procs.rs` | Per-process CPU and GPU use, and what was busy each time the fans came on (window only) |
 | `src/worker.rs` | The once-a-second control loop and Smart Cooling (`SmartCtl`) |
 | `src/helper.rs` | Background helper: install/remove, socket server, restore preset at boot |
 | `src/auth.rs` | macOS admin password prompt |

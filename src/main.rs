@@ -5,6 +5,7 @@ mod fans;
 mod helper;
 mod load;
 mod native;
+mod procs;
 #[cfg(debug_assertions)]
 mod sample;
 mod sensors;
@@ -32,6 +33,7 @@ USAGE:
     macsmartcooler auto [fan]      return a fan (or all fans) to automatic   [root]
     macsmartcooler smart [lo] [hi] headless Smart Cooling until Ctrl-C       [root]
     macsmartcooler watch           print Smart Cooling's decision every second (changes nothing)
+    macsmartcooler top             print the busiest processes (CPU and GPU, last 30 s) every 2 s
     macsmartcooler selftest        check on the real hardware that the helper really controls
                                    the fans (sets each to a fixed speed, then restores)
     macsmartcooler install-helper  install the background helper (asks for password once)
@@ -57,6 +59,7 @@ fn main() {
         ["smart", rest @ ..] if rest.len() <= 2 => cli_smart(rest),
         ["daemon"] => helper::serve(),
         ["watch"] => cli_watch(),
+        ["top"] => cli_top(),
         ["selftest"] => cli_selftest(),
         ["__install-root", src] => helper::install_as_root(src),
         ["__uninstall-root"] => helper::uninstall_as_root(),
@@ -325,6 +328,27 @@ fn run_gui() -> Result<(), String> {
 }
 
 /// Dry run of Smart Cooling on live sensors: prints what it would do, never touches the fans.
+/// The busiest processes, averaged over the last 30 s (as in the window's Processes tab).
+fn cli_top() -> Result<(), String> {
+    use std::io::Write;
+    let start = std::time::Instant::now();
+    let mut tracker = procs::Tracker::default();
+    loop {
+        let (all, gpu_known) = procs::read_all()?;
+        tracker.push(start.elapsed().as_secs_f64(), all);
+        let rows = tracker.usage(procs::TABLE_SECS, procs::my_uid());
+        let mut out = format!("\n{:>3.0}s averaged   {:<34} {:>7} {:>6}\n", tracker.span(procs::TABLE_SECS), "PROCESS", "CPU", if gpu_known { "GPU" } else { "" });
+        for r in rows.iter().take(15) {
+            let n = if r.pids.len() > 1 { format!("{} (×{})", r.name, r.pids.len()) } else { r.name.clone() };
+            out += &format!("              {:<34} {:>7} {:>6}\n", n, procs::cpu_text(r.cpu), if gpu_known { procs::gpu_text(r.gpu) } else { String::new() });
+        }
+        if write!(std::io::stdout(), "{out}").is_err() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
 fn cli_watch() -> Result<(), String> {
     use std::io::Write;
     let mut smc = Smc::open()?;
