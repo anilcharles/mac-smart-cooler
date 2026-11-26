@@ -156,6 +156,10 @@ fn display_name(r: &Reading) -> &str {
     match r.key.as_str() {
         "TaLP" => "Case Air Left",
         "TaRF" => "Case Air Right",
+        // The keys don't name a side. Resting a palm on the left palm rest warmed Ts0P and
+        // left Ts1P unchanged (16-inch M1 Max; one test, at whole-degree resolution).
+        "Ts0P" => "Palm Rest Left",
+        "Ts1P" => "Palm Rest Right",
         "TW0P" => "Wi-Fi Module",
         HOT_KEY => "Hottest Core",
         _ => &r.name,
